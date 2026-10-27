@@ -9,9 +9,11 @@ test:
 	shellcheck -S warning bin/herd
 
 # Copy into $(PREFIX) (default ~/.local). PKGBUILD uses this with PREFIX=/usr.
+# No install -D: macOS's BSD install doesn't have it.
 install:
-	install -Dm755 bin/herd $(BIN)/herd
-	install -Dm644 examples/tasks.example.txt $(SHARE)/tasks.example.txt
+	install -d $(BIN) $(SHARE)
+	install -m755 bin/herd $(BIN)/herd
+	install -m644 examples/tasks.example.txt $(SHARE)/tasks.example.txt
 
 # Dev install: symlink, so edits in this checkout are live.
 link:

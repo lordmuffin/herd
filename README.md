@@ -59,6 +59,22 @@ make link            # make uninstall to remove
 Use one of the two per machine. `~/.local/bin` usually comes first in `PATH`, so a symlink
 there hides the packaged `/usr/bin/herd`.
 
+**macOS** (no package; a checkout plus `make link`):
+
+```bash
+brew install jq forgejo-cli       # git, curl, bash 3.2 and column ship with macOS
+git clone ssh://git@git-ssh.apj.dev/lordmuffin/herd.git ~/git/herd && cd ~/git/herd
+make link                         # ~/.local/bin/herd -> this checkout; update with git pull
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zprofile   # if ~/.local/bin isn't on PATH yet
+fj auth login                     # only needed for herd done
+```
+
+Install [herdr](https://herdr.dev) as well, and run `herd` from inside a Herdr pane.
+
+- **bash:** `herd` runs on macOS's stock bash 3.2 and doesn't need Homebrew bash.
+- **`fj` token store:** on macOS it lives under `~/Library/Application Support/`, and `herd`
+  finds it there. If yours is elsewhere, set `FJ_KEYS=/path/to/keys.json`.
+
 ## Develop
 
 `make test` runs `bash -n` and `shellcheck -S warning`, the same checks `makepkg` runs.

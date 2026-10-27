@@ -56,9 +56,20 @@ cmd_rm() {
   for target in "$@"; do find_wt "$target" && remove_wt; done
 }
 
+# fj's token store: XDG data dir on Linux, ~/Library/Application Support/<bundle id> on macOS.
+fj_keys() {
+  local k
+  for k in "${FJ_KEYS:-}" "${XDG_DATA_HOME:-$HOME/.local/share}/forgejo-cli/keys.json" \
+           "$HOME/Library/Application Support/"*forgejo-cli*/keys.json; do
+    [[ -n $k && -f $k ]] && { echo "$k"; return; }
+  done
+  die "no fj token store found (run: fj auth login, or set FJ_KEYS=/path/to/keys.json)"
+}
+
 # Forgejo API call authenticated with fj's stored token for the origin host.
 forgejo() {
-  local url host keys=~/.local/share/forgejo-cli/keys.json tok
+  local url host keys tok
+  keys=$(fj_keys)
   url=$(git -C "$repo" remote get-url origin)
   host=$(sed -E 's#^[a-z+]+://([^@/]+@)?([^:/]+).*#\2#; s#^[^@]+@([^:]+):.*#\1#' <<<"$url")
   host=$(jq -r --arg h "$host" '.aliases[$h] // $h' "$keys")
@@ -141,7 +152,7 @@ spawn() {
           --path "$path" --label "$name" --no-focus) || die "worktree create failed for $branch"
   pane=$(jq -r '.result.root_pane.pane_id' <<<"$out")
 
-  h agent start "$name" --kind "$kind" --pane "$pane" --timeout 90000 -- "${agent_args[@]}" >/dev/null \
+  h agent start "$name" --kind "$kind" --pane "$pane" --timeout 90000 -- ${agent_args[@]+"${agent_args[@]}"} >/dev/null \
     || die "agent start failed for $name (pane $pane) — inspect with: herdr agent read $name"
   # Wait only until the turn has visibly started, so a later `agent wait` can't see the pre-prompt idle.
   h agent prompt "$name" "$prompt" --wait --until working --until blocked --until "done" --timeout 30000 >/dev/null \
