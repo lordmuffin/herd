@@ -1,0 +1,21 @@
+# herd task file: one task per line, as  <branch>: <prompt>
+#   - Only the first ":" splits the line, so prompts can contain colons.
+#   - Each prompt must fit on one line.
+#   - Blank lines and lines starting with # are skipped.
+#   - The branch name also names the agent (fix/foo-bar -> fix-foo-bar). Keep it short and unique.
+#
+# Run:   herd -f ~/.config/herd/tasks.example.txt        (add -w to wait for all of them)
+# Check: herd ls
+# Clean: herd rm <branch>   (after the PR merges)
+
+# A scoped fix that goes all the way to a PR (the agent follows CLAUDE.md's PR + review-me rules)
+fix/cnpg-offsite-backup: CLAUDE.md says no CNPG database has an offsite copy because barman only writes to SeaweedFS on the NAS. Read docs/postgres-cnpg.md §Backups and apps/storage/postgres-cluster/, then add a second barman target for Backblaze B2 using a OnePasswordItem for the credentials. Follow TDD.md, run make test, open a PR and label it review-me.
+
+# Docs-only work: say what it may touch
+docs/harbor-troubleshooting: Add a Troubleshooting section to docs/harbor-pull-through-cache.md covering a Harbor outage, a stale registries.yaml on a node, and nvcr.io auth failures. Edit only that doc. Run make test, then open a PR labelled review-me.
+
+# Investigation only: stop before changing anything
+chore/flux-wait-audit: Audit every Flux Kustomization under clusters/k3s2/ for wait: true. Using docs/flux-worker-budget.md, list each one that nothing dependsOn. Do NOT edit files or push. Write the findings to FINDINGS.md in this worktree and stop.
+
+# A larger task: ask for a plan first and wait for review
+feat/node-control-phase2: Read docs/node-control-dashboard.md and service-control/app/nodes/. Write a phase-2 plan (package updates through node-control-agent, reusing scripts/pve-node-lifecycle/lifecycle.py gates) to PLAN.md. Do not implement anything yet. Stop and wait for my review.

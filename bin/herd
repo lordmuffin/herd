@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# herd — fan out coding agents into fresh git worktrees, one Herdr workspace each.
+#
+#   herd [opts] <branch> <prompt> [<branch> <prompt> ...]
+#   herd [opts] -f tasks.txt          # one "branch: prompt" per line, # comments ok
+#   herd ls                           # agents + their status
+#   herd rm <branch|name>...          # remove worktree, workspace and local branch
+#   herd done [-F] <branch|name>...   # after merge: check PR merged + agent idle + tree clean,
+#                                     # then rm and delete the remote branch (-F skips checks)
+#
+# opts:
+#   -r <repo>     source checkout (default: git toplevel of $PWD)
+#   -b <ref>      base ref (default: origin/main, fetched first)
+#   -k <kind>     agent kind (default: claude)
+#   -p <ws-id>    parent workspace to group under (default: the one labelled like the repo)
+#   -m <machine>  saved herdr machine (remote paths go under ~/git/wt)
+#   -w            wait for every agent to finish, then print a summary
+#   -- <args>     extra args passed to the agent (e.g. -- --model sonnet)
+#
+# Branch names double as agent names: fix/foo-bar -> agent "fix-foo-bar".
+set -euo pipefail
+
+repo="" base="origin/main" kind="claude" machine="" parent="" parent_ws="" wait=0 force=0 file="" agent_args=()
+
+die() { echo "herd: $*" >&2; exit 1; }
+h() { if [[ -n $machine ]]; then herdr --machine "$machine" "$@"; else herdr "$@"; fi; }
+agent_name() { local n; n=$(tr 'A-Z/._' 'a-z---' <<<"$1" | tr -cd 'a-z0-9_-'); n=${n#[-_0-9]}; echo "${n:0:32}"; }
+
+cmd_ls() {
+  h agent list | jq -r '.result.agents[] | [.name // "-", .agent, .agent_status, .cwd] | @tsv' | column -t -s $'\t'
+}
+
+# Sets ws, path, branch for a linked worktree matching a branch or agent name; fails if none.
+find_wt() {
+  ws="" path="" branch=""
+  [[ -n ${wt_list:-} ]] || wt_list=$(h worktree list --cwd "$repo" 2>/dev/null || h worktree list)
+  read -r ws path branch < <(jq -r --arg t "$1" --arg n "$(agent_name "$1")" '
+    .result.worktrees[] | select(.is_linked_worktree)
+    | select(.branch == $t or (.path | endswith("/" + $n)))
+    | [.open_workspace_id // "-", .path, .branch] | @tsv' <<<"$wt_list" | head -1) || true
+  [[ -n $path ]] || { echo "herd: no worktree for $1" >&2; return 1; }
+}
+
+remove_wt() {
+  if [[ $ws != "-" ]]; then
+    h worktree remove --workspace "$ws" --force >/dev/null
+  else
+    git -C "$repo" worktree remove --force "$path"
+  fi
+  git -C "$repo" branch -D "$branch" >/dev/null 2>&1 || true
+  echo "removed $branch ($path)"
+}
+
+cmd_rm() {
+  [[ -n $repo ]] || repo=$(git rev-parse --show-toplevel)
+  for target in "$@"; do find_wt "$target" && remove_wt; done
+}
+
+# Forgejo API call authenticated with fj's stored token for the origin host.
+forgejo() {
+  local url host keys=~/.local/share/forgejo-cli/keys.json tok
+  url=$(git -C "$repo" remote get-url origin)
+  host=$(sed -E 's#^[a-z+]+://([^@/]+@)?([^:/]+).*#\2#; s#^[^@]+@([^:]+):.*#\1#' <<<"$url")
+  host=$(jq -r --arg h "$host" '.aliases[$h] // $h' "$keys")
+  tok=$(jq -r --arg h "$host" '.hosts[$h].token // empty' "$keys")
+  [[ -n $tok ]] || die "no fj token for $host (run: fj auth login)"
+  repo_slug=$(sed -E 's#\.git$##; s#.*[:/]([^/]+/[^/]+)$#\1#' <<<"$url")
+  curl -sf -H "Authorization: token $tok" "https://$host/api/v1/repos/$repo_slug/$1"
+}
+
+# Clean up a stream only once its PR is merged: agent idle, worktree clean, then worktree,
+# workspace, local and remote branch all go.
+cmd_done() {
+  [[ -n $repo ]] || repo=$(git rev-parse --show-toplevel)
+  local into=${base#origin/} pr status dirty
+  for target in "$@"; do
+    find_wt "$target" || continue
+    if ! pr=$(forgejo "pulls/$into/$branch"); then
+      echo "herd: $branch has no PR into $into — not removing (use herd rm to discard)" >&2; continue
+    fi
+    if [[ $(jq -r .merged <<<"$pr") != true ]]; then
+      echo "herd: $branch PR #$(jq -r .number <<<"$pr") is $(jq -r .state <<<"$pr"), not merged — skipping" >&2
+      ((force)) || continue
+    fi
+    # A PR merged before the agent's last push leaves commits only on this branch.
+    git -C "$repo" fetch -q origin "$into"
+    local unmerged; unmerged=$(git -C "$path" log --oneline "origin/$into..HEAD")
+    if [[ -n $unmerged ]]; then
+      echo "herd: $branch has commits not in $into — skipping (open a follow-up PR):" >&2
+      sed 's/^/    /' <<<"$unmerged" >&2; ((force)) || continue
+    fi
+    status=$(h agent list | jq -r --arg p "$path" '.result.agents[] | select(.cwd == $p) | .agent_status' | head -1)
+    if [[ $status == working || $status == blocked ]]; then
+      echo "herd: agent in $branch is $status — skipping" >&2; ((force)) || continue
+    fi
+    dirty=$(git -C "$path" status --porcelain)
+    if [[ -n $dirty ]]; then
+      echo "herd: $branch has uncommitted changes — skipping:" >&2; sed 's/^/    /' <<<"$dirty" >&2
+      ((force)) || continue
+    fi
+    remove_wt
+    if git -C "$repo" ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+      git -C "$repo" push -q origin --delete "$branch" && echo "deleted origin/$branch"
+    fi
+    echo "done: PR #$(jq -r .number <<<"$pr") $(jq -r .html_url <<<"$pr")"
+  done
+}
+
+# Herdr nests a worktree under the workspace it is created from. Prefer the one named after the
+# repo, so worktrees don't land under some other workspace (e.g. a K9S one) that happens to sit in
+# the repo root.
+pick_parent() {
+  [[ -n $parent ]] && { echo "$parent"; return; }
+  local name ws
+  name=$(basename "$repo")
+  ws=$(h workspace list | jq -r --arg n "$name" --arg r "$repo" '
+    [.result.workspaces[] | select(.label == $n)]
+    | (map(select(.worktree.repo_root == $r and (.worktree.is_linked_worktree | not))) + .)
+    | .[].workspace_id' | awk '!seen[$0]++')
+  for w in $ws; do
+    if h pane list --workspace "$w" | jq -e --arg r "$repo" \
+        'any(.result.panes[]; .cwd == $r or (.cwd | startswith($r + "/")))' >/dev/null; then
+      echo "$w"; return
+    fi
+  done
+  if [[ -n ${HERDR_WORKSPACE_ID:-} && -z $machine && $PWD == "$repo"* ]]; then
+    echo "$HERDR_WORKSPACE_ID"
+  fi
+}
+
+spawn() {
+  local branch=$1 prompt=$2 name path out pane
+  name=$(agent_name "$branch")
+  # shellcheck disable=SC2088  # herdr expands ~ on the remote host
+  if [[ -n $machine ]]; then path="~/git/wt/$(basename "$repo")/$name"
+  else path="$HOME/git/wt/$(basename "$repo")/$name"; fi
+
+  local src=(--cwd "$repo")
+  [[ -n $parent_ws ]] && src=(--workspace "$parent_ws")
+  out=$(h worktree create "${src[@]}" --branch "$branch" --base "$base" \
+          --path "$path" --label "$name" --no-focus) || die "worktree create failed for $branch"
+  pane=$(jq -r '.result.root_pane.pane_id' <<<"$out")
+
+  h agent start "$name" --kind "$kind" --pane "$pane" --timeout 90000 -- "${agent_args[@]}" >/dev/null \
+    || die "agent start failed for $name (pane $pane) — inspect with: herdr agent read $name"
+  # Wait only until the turn has visibly started, so a later `agent wait` can't see the pre-prompt idle.
+  h agent prompt "$name" "$prompt" --wait --until working --until blocked --until "done" --timeout 30000 >/dev/null \
+    || die "prompt not picked up by $name — inspect with: herdr agent read $name"
+  echo "started $name  ($branch -> $path, pane $pane)"
+  names+=("$name")
+}
+
+case ${1:-} in
+  ls) shift; cmd_ls; exit ;;
+  "done") shift; while getopts "r:b:F" o; do case $o in r) repo=$OPTARG;; b) base=$OPTARG;; F) force=1;; *) exit 2;; esac; done
+      shift $((OPTIND-1)); [[ $# -gt 0 ]] || die "done needs a branch or agent name"; cmd_done "$@"; exit ;;
+  rm) shift; while getopts "r:m:" o; do case $o in r) repo=$OPTARG;; m) machine=$OPTARG;; *) exit 2;; esac; done
+      shift $((OPTIND-1)); [[ $# -gt 0 ]] || die "rm needs a branch or agent name"; cmd_rm "$@"; exit ;;
+esac
+
+while getopts "r:b:k:m:p:f:wh" o; do
+  case $o in
+    r) repo=$OPTARG ;; b) base=$OPTARG ;; k) kind=$OPTARG ;; m) machine=$OPTARG ;;
+    p) parent=$OPTARG ;; f) file=$OPTARG ;; w) wait=1 ;; h) sed -n '2,23p' "$0"; exit ;; *) exit 2 ;;
+  esac
+done
+shift $((OPTIND-1))
+
+tasks=()
+while [[ $# -gt 0 && $1 != "--" ]]; do
+  [[ $# -ge 2 ]] || die "expected <branch> <prompt> pairs"
+  tasks+=("$1" "$2"); shift 2
+done
+[[ ${1:-} == "--" ]] && { shift; agent_args=("$@"); }
+
+if [[ -n $file ]]; then
+  while IFS= read -r line; do
+    [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ $line == *:* ]] || die "bad line (want 'branch: prompt'): $line"
+    tasks+=("${line%%:*}" "$(sed 's/^[[:space:]]*//' <<<"${line#*:}")")
+  done <"$file"
+fi
+[[ ${#tasks[@]} -gt 0 ]] || { sed -n '2,23p' "$0"; exit 2; }
+
+if [[ -z $machine ]]; then
+  [[ -n $repo ]] || repo=$(git rev-parse --show-toplevel)
+  repo=$(cd "$repo" && git rev-parse --show-toplevel)
+  [[ $base == origin/* ]] && git -C "$repo" fetch -q origin "${base#origin/}"
+else
+  [[ -n $repo ]] || die "-m needs -r <remote repo path>"
+fi
+
+parent_ws=$(pick_parent)
+[[ -n $parent_ws ]] && echo "grouping under workspace $parent_ws"
+names=()
+for ((i = 0; i < ${#tasks[@]}; i += 2)); do spawn "${tasks[i]}" "${tasks[i+1]}"; done
+
+if ((wait)); then
+  echo "waiting for ${#names[@]} agent(s)..."
+  for n in "${names[@]}"; do
+    s=$(h agent wait "$n" 2>/dev/null | jq -r '.result.agent.agent_status' || echo "?")
+    echo "  $n: $s"
+  done
+fi

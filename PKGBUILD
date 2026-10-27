@@ -1,0 +1,34 @@
+# Maintainer: Andrew Jackson <dorkmeisterx69@gmail.com>
+pkgname=herd-git
+pkgver=r1.0000000
+pkgrel=1
+pkgdesc="Fan out coding agents into git worktrees, one Herdr workspace each"
+arch=('any')
+url="https://git.apj.dev/lordmuffin/herd"
+license=('MIT')
+depends=('bash' 'git' 'jq' 'curl' 'util-linux')
+makedepends=('git')
+checkdepends=('shellcheck')
+optdepends=('forgejo-cli: Forgejo login used by herd done to check PR merge state')
+provides=('herd')
+conflicts=('herd')
+# Private repo: cloned over SSH with your own key. herdr itself is not packaged;
+# install it from https://herdr.dev (it lands in ~/.local/bin).
+source=("herd::git+ssh://git@git-ssh.apj.dev/lordmuffin/herd.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd herd
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+check() {
+  cd herd
+  make test
+}
+
+package() {
+  cd herd
+  make install DESTDIR="$pkgdir" PREFIX=/usr
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
