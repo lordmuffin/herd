@@ -5,9 +5,12 @@
 #   herd [opts] -f tasks.txt          # one "branch: prompt" per line, # comments ok
 #   herd ls                           # agents + their status
 #   herd personas [<name>]            # list personas, or print one as a ready-to-paste prompt
-#   herd rm <branch|name>...          # remove worktree, workspace and local branch
-#   herd done [-F] <branch|name>...   # after merge: check PR merged + agent idle + tree clean,
-#                                     # then rm and delete the remote branch (-F skips checks)
+#   herd rm [-f file] <branch|name>...        # remove worktree, workspace and local branch
+#   herd done [-F] [-f file] <branch|name>... # after merge: check PR merged + agent idle + tree
+#                                     # clean, then rm and delete the remote branch (-F skips checks)
+#                                     # -f takes the same file as spawning (or "-" for stdin); only
+#                                     # the branch before the first ":" is used, so one file can
+#                                     # start a batch and later close it
 #
 # opts:
 #   -r <repo>     source checkout (default: git toplevel of $PWD)
@@ -29,7 +32,7 @@
 # A name that matches no file exactly falls back to a case-insensitive fuzzy match (-P kai).
 set -euo pipefail
 
-repo="" base="origin/main" kind="claude" machine="" parent="" parent_ws="" wait=0 force=0 file="" agent_args=()
+repo="" base="origin/main" kind="claude" machine="" parent="" parent_ws="" wait=0 force=0 file="" agent_args=() targets=()
 persona="" dry=0
 
 die() { echo "herd: $*" >&2; exit 1; }
@@ -128,6 +131,17 @@ cmd_personas() {
         printf '%s\t%s\t%s\n' "$n" "${desc:--}" "$f"
       done
     done < <(persona_dirs); } | awk -F'\t' '!seen[$1]++' | column -t -s $'\t'
+}
+
+# Appends the branch of each "branch[ @persona][: prompt]" line in $1 ("-" = stdin) to targets.
+read_targets() {
+  local line
+  [[ $1 == - || -f $1 ]] || die "no such file: $1"
+  while IFS= read -r line; do
+    [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+    split_key "${line%%:*}"
+    [[ -n $task_branch ]] && targets+=("$task_branch")
+  done < <(if [[ $1 == - ]]; then cat; else cat "$1"; fi)
 }
 
 cmd_ls() {
@@ -273,10 +287,12 @@ case ${1:-} in
   ls) shift; cmd_ls; exit ;;
   personas) shift; [[ $# -le 1 ]] || die "personas takes at most one name"
       repo=$(git rev-parse --show-toplevel 2>/dev/null || true); cmd_personas "$@"; exit ;;
-  "done") shift; while getopts "r:b:F" o; do case $o in r) repo=$OPTARG;; b) base=$OPTARG;; F) force=1;; *) exit 2;; esac; done
-      shift $((OPTIND-1)); [[ $# -gt 0 ]] || die "done needs a branch or agent name"; cmd_done "$@"; exit ;;
-  rm) shift; while getopts "r:m:" o; do case $o in r) repo=$OPTARG;; m) machine=$OPTARG;; *) exit 2;; esac; done
-      shift $((OPTIND-1)); [[ $# -gt 0 ]] || die "rm needs a branch or agent name"; cmd_rm "$@"; exit ;;
+  "done") shift; while getopts "r:b:Ff:" o; do case $o in r) repo=$OPTARG;; b) base=$OPTARG;; F) force=1;; f) file=$OPTARG;; *) exit 2;; esac; done
+      shift $((OPTIND-1)); targets=("$@"); [[ -z $file ]] || read_targets "$file"
+      [[ ${#targets[@]} -gt 0 ]] || die "done needs a branch or agent name (or -f file)"; cmd_done "${targets[@]}"; exit ;;
+  rm) shift; while getopts "r:m:f:" o; do case $o in r) repo=$OPTARG;; m) machine=$OPTARG;; f) file=$OPTARG;; *) exit 2;; esac; done
+      shift $((OPTIND-1)); targets=("$@"); [[ -z $file ]] || read_targets "$file"
+      [[ ${#targets[@]} -gt 0 ]] || die "rm needs a branch or agent name (or -f file)"; cmd_rm "${targets[@]}"; exit ;;
 esac
 
 while getopts "r:b:k:m:p:P:f:wnh" o; do

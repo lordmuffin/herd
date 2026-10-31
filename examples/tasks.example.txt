@@ -9,7 +9,7 @@
 #
 # Run:   herd -f ~/.config/herd/tasks.example.txt        (add -w to wait for all of them)
 # Check: herd -n -f ... to see what would start, herd ls for what is running
-# Clean: herd rm <branch>   (after the PR merges)
+# Clean: herd done -f <this file>   (after the PRs merge; or herd rm <branch> to discard)
 
 # A scoped fix that goes all the way to a PR. @engineer brings the TDD + small-diff + PR rules,
 # so the prompt just has to say what to change.
