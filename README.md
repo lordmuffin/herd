@@ -70,6 +70,12 @@ Any `.md` file works — there is no schema. The `> ...` line under the title is
 3. `~/.config/herd/personas/` (`$XDG_CONFIG_HOME` honoured)
 4. the ones shipped with `herd`
 
+A name with no exact file falls back to a case-insensitive fuzzy match, so `-P kai` finds
+`Kai - The Kaizen Engineer.md`. A match on the whole name or its first word wins over one that merely
+contains the text (`kai` is not ambiguous with `Kairos`); anything still ambiguous errors and lists
+the candidates. To get short names for files with long ones, symlink them into
+`~/.config/herd/personas/` (`ln -s "/path/Forge - The Platform Engineer.md" forge.md`).
+
 `-P` also takes a path, so `-P ./one-off.md` works without installing anything. Every persona
 in a run is resolved before any agent starts, so a typo fails the whole run instead of leaving
 half a fan-out going.

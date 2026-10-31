@@ -29,6 +29,7 @@
 #   fix/foo @engineer: Fix X. Run make test, open a PR labelled review-me.
 # Personas are read from $HERD_PERSONA_DIR, <repo>/.herd/personas, ~/.config/herd/personas,
 # then the ones shipped with herd. "@none" runs the prompt bare.
+# A name that matches no file exactly falls back to a case-insensitive fuzzy match (-P kai).
 set -euo pipefail
 
 repo="" base="origin/main" kind="claude" machine="" parent="" parent_ws="" wait=0 force=0 file="" agent_args=() targets=()
@@ -71,7 +72,31 @@ persona_file() {
   while IFS= read -r d; do
     [[ -f "$d/$n.md" ]] && { echo "$d/$n.md"; return; }
   done < <(persona_dirs)
-  die "unknown persona: $n (herd personas lists them)"
+  persona_fuzzy "$n"
+}
+
+# Last resort for persona_file: a case-insensitive match on the file name. A name that is the whole
+# name or its first word ("kai" -> "Kai - The Kaizen Engineer") beats one that merely contains it
+# ("kai" also sits inside "Kairos"). Must resolve to exactly one persona.
+persona_fuzzy() {
+  local q d f b all="" hits tier
+  q=$(tr 'A-Z' 'a-z' <<<"$1")
+  while IFS= read -r d; do
+    [[ -d $d ]] || continue
+    for f in "$d"/*.md; do
+      [[ -f $f ]] || continue
+      b=$(basename "$f" .md)
+      all+=$(printf '%s\t%s\t%s' "$(tr 'A-Z' 'a-z' <<<"$b")" "$b" "$f")$'\n'
+    done
+  done < <(persona_dirs)
+  for tier in first any; do
+    hits=$(awk -F'\t' -v q="$q" -v t="$tier" '
+      !seen[$2]++ && (t == "any" ? index($1, q) : ($1 == q || index($1, q " ") == 1 || index($1, q "-") == 1)) { print }' <<<"$all")
+    [[ -n $hits ]] || continue
+    if [[ $(wc -l <<<"$hits") -eq 1 ]]; then cut -f3 <<<"$hits"; return; fi
+    die "persona '$1' is ambiguous: $(cut -f2 <<<"$hits" | paste -sd, - | sed 's/,/, /g')"
+  done
+  die "unknown persona: $1 (herd personas lists them)"
 }
 
 # Persona text, a rule, then the task — so the agent reads the role before the job.
