@@ -56,9 +56,20 @@ cmd_rm() {
   for target in "$@"; do find_wt "$target" && remove_wt; done
 }
 
+# forgejo-cli's token store: XDG data dir on Linux, Application Support on macOS.
+forgejo_keys() {
+  local c
+  for c in "${XDG_DATA_HOME:-$HOME/.local/share}/forgejo-cli/keys.json" \
+           "$HOME/Library/Application Support/forgejo-cli/keys.json"; do
+    [[ -f $c ]] && { echo "$c"; return; }
+  done
+  die "no forgejo-cli keys.json (run: fj auth login)"
+}
+
 # Forgejo API call authenticated with fj's stored token for the origin host.
 forgejo() {
-  local url host keys=~/.local/share/forgejo-cli/keys.json tok
+  local url host keys tok
+  keys=$(forgejo_keys)
   url=$(git -C "$repo" remote get-url origin)
   host=$(sed -E 's#^[a-z+]+://([^@/]+@)?([^:/]+).*#\2#; s#^[^@]+@([^:]+):.*#\1#' <<<"$url")
   host=$(jq -r --arg h "$host" '.aliases[$h] // $h' "$keys")
@@ -161,7 +172,7 @@ esac
 while getopts "r:b:k:m:p:f:wh" o; do
   case $o in
     r) repo=$OPTARG ;; b) base=$OPTARG ;; k) kind=$OPTARG ;; m) machine=$OPTARG ;;
-    p) parent=$OPTARG ;; f) file=$OPTARG ;; w) wait=1 ;; h) sed -n '2,23p' "$0"; exit ;; *) exit 2 ;;
+    p) parent=$OPTARG ;; f) file=$OPTARG ;; w) wait=1 ;; h) sed -n '2,20p' "$0"; exit ;; *) exit 2 ;;
   esac
 done
 shift $((OPTIND-1))
@@ -180,7 +191,7 @@ if [[ -n $file ]]; then
     tasks+=("${line%%:*}" "$(sed 's/^[[:space:]]*//' <<<"${line#*:}")")
   done <"$file"
 fi
-[[ ${#tasks[@]} -gt 0 ]] || { sed -n '2,23p' "$0"; exit 2; }
+[[ ${#tasks[@]} -gt 0 ]] || { sed -n '2,20p' "$0"; exit 2; }
 
 if [[ -z $machine ]]; then
   [[ -n $repo ]] || repo=$(git rev-parse --show-toplevel)

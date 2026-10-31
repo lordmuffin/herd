@@ -59,6 +59,20 @@ make link            # make uninstall to remove
 Use one of the two per machine. `~/.local/bin` usually comes first in `PATH`, so a symlink
 there hides the packaged `/usr/bin/herd`.
 
+**macOS** — `makepkg` is Arch-only, and `make install` needs GNU coreutils (BSD `install` has
+no `-D`), so use the dev checkout:
+
+```bash
+brew install bash jq shellcheck
+git clone ssh://git@git-ssh.apj.dev/lordmuffin/herd.git && cd herd
+make link            # git pull to update
+```
+
+Homebrew's bash is required: `herd` uses bash 4+ features and macOS ships 3.2 at `/bin/bash`.
+Stock `/usr/bin/column` and `curl` are fine. For `herd done`, add `brew install forgejo-cli`;
+its token lands in `~/Library/Application Support/forgejo-cli/keys.json`, which `herd` checks
+after the XDG path.
+
 ## Develop
 
 `make test` runs `bash -n` and `shellcheck -S warning`, the same checks `makepkg` runs.
