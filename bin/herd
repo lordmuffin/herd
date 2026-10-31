@@ -59,7 +59,10 @@ cmd_rm() {
 # forgejo-cli's token store: XDG data dir on Linux, Application Support on macOS.
 forgejo_keys() {
   local c
+  # macOS: the directories crate names the dir <qualifier>.<org>.<app>, which with
+  # neither qualifier nor org set doubles the app name.
   for c in "${XDG_DATA_HOME:-$HOME/.local/share}/forgejo-cli/keys.json" \
+           "$HOME/Library/Application Support/forgejo-cli.forgejo-cli/keys.json" \
            "$HOME/Library/Application Support/forgejo-cli/keys.json"; do
     [[ -f $c ]] && { echo "$c"; return; }
   done

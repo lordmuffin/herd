@@ -70,8 +70,8 @@ make link            # git pull to update
 
 Homebrew's bash is required: `herd` uses bash 4+ features and macOS ships 3.2 at `/bin/bash`.
 Stock `/usr/bin/column` and `curl` are fine. For `herd done`, add `brew install forgejo-cli`;
-its token lands in `~/Library/Application Support/forgejo-cli/keys.json`, which `herd` checks
-after the XDG path.
+its token lands in `~/Library/Application Support/forgejo-cli.forgejo-cli/keys.json` (the
+doubled name is the `directories` crate's macOS layout), which `herd` checks after the XDG path.
 
 ## Develop
 
