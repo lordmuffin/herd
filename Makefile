@@ -11,7 +11,7 @@ test:
 # Copy into $(PREFIX) (default ~/.local). PKGBUILD uses this with PREFIX=/usr.
 install:
 	install -Dm755 bin/herd $(BIN)/herd
-	install -Dm644 examples/tasks.example.txt $(SHARE)/tasks.example.txt
+	install -Dm644 examples/Tasks.example.herd $(SHARE)/Tasks.example.herd
 	mkdir -p $(SHARE)/personas
 	install -m644 personas/*.md $(SHARE)/personas/
 

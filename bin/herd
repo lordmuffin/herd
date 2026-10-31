@@ -2,7 +2,8 @@
 # herd — fan out coding agents into fresh git worktrees, one Herdr workspace each.
 #
 #   herd [opts] <branch> <prompt> [<branch> <prompt> ...]
-#   herd [opts] -f tasks.txt          # one "branch: prompt" per line, # comments ok
+#   herd [opts] [-f Tasks.herd]       # one "branch: prompt" per line, # comments ok; with no
+#                                     # tasks given, reads Tasks.herd from the repo root
 #   herd ls                           # agents + their status
 #   herd personas [<name>]            # list personas, or print one as a ready-to-paste prompt
 #   herd rm [-f file] <branch|name>...        # remove worktree, workspace and local branch
@@ -10,7 +11,8 @@
 #                                     # clean, then rm and delete the remote branch (-F skips checks)
 #                                     # -f takes the same file as spawning (or "-" for stdin); only
 #                                     # the branch before the first ":" is used, so one file can
-#                                     # start a batch and later close it
+#                                     # start a batch and later close it. done with no targets
+#                                     # reads Tasks.herd too; rm never does, it must be named
 #
 # opts:
 #   -r <repo>     source checkout (default: git toplevel of $PWD)
@@ -131,6 +133,18 @@ cmd_personas() {
         printf '%s\t%s\t%s\n' "$n" "${desc:--}" "$f"
       done
     done < <(persona_dirs); } | awk -F'\t' '!seen[$1]++' | column -t -s $'\t'
+}
+
+# Prints the repo root's Tasks.herd if there is one, and says so on stderr. With -m, -r is a path
+# on the remote, so the file is looked for in the local checkout.
+default_file() {
+  local root=$repo
+  [[ -z $machine ]] || root=""
+  [[ -n $root ]] || root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+  if [[ -f $root/Tasks.herd ]]; then
+    echo "herd: using $root/Tasks.herd" >&2
+    echo "$root/Tasks.herd"
+  fi
 }
 
 # Appends the branch of each "branch[ @persona][: prompt]" line in $1 ("-" = stdin) to targets.
@@ -288,8 +302,9 @@ case ${1:-} in
   personas) shift; [[ $# -le 1 ]] || die "personas takes at most one name"
       repo=$(git rev-parse --show-toplevel 2>/dev/null || true); cmd_personas "$@"; exit ;;
   "done") shift; while getopts "r:b:Ff:" o; do case $o in r) repo=$OPTARG;; b) base=$OPTARG;; F) force=1;; f) file=$OPTARG;; *) exit 2;; esac; done
-      shift $((OPTIND-1)); targets=("$@"); [[ -z $file ]] || read_targets "$file"
-      [[ ${#targets[@]} -gt 0 ]] || die "done needs a branch or agent name (or -f file)"; cmd_done "${targets[@]}"; exit ;;
+      shift $((OPTIND-1)); targets=("$@"); [[ -n $file || $# -gt 0 ]] || file=$(default_file)
+      [[ -z $file ]] || read_targets "$file"
+      [[ ${#targets[@]} -gt 0 ]] || die "done needs a branch or agent name (or -f file, or a Tasks.herd)"; cmd_done "${targets[@]}"; exit ;;
   rm) shift; while getopts "r:m:f:" o; do case $o in r) repo=$OPTARG;; m) machine=$OPTARG;; f) file=$OPTARG;; *) exit 2;; esac; done
       shift $((OPTIND-1)); targets=("$@"); [[ -z $file ]] || read_targets "$file"
       [[ ${#targets[@]} -gt 0 ]] || die "rm needs a branch or agent name (or -f file)"; cmd_rm "${targets[@]}"; exit ;;
@@ -311,6 +326,7 @@ while [[ $# -gt 0 && $1 != "--" ]]; do
 done
 [[ ${1:-} == "--" ]] && { shift; agent_args=("$@"); }
 
+[[ -n $file || ${#tasks[@]} -gt 0 ]] || file=$(default_file)
 if [[ -n $file ]]; then
   while IFS= read -r line; do
     [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
