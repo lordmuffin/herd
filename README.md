@@ -9,7 +9,9 @@ herd -f tasks.txt                                          # a batch, "branch [@
 herd -n -f tasks.txt                                       # dry run: what would start, and as what
 herd ls                                                    # agents and their status
 herd done fix/foo                                          # after merge: remove worktree + branches
+herd done -f tasks.txt                                      # close a whole batch with the same file
 herd rm fix/foo                                            # discard a stream (no checks)
+herd rm -f tasks.txt                                       # discard a whole batch
 ```
 
 `herd -h` lists every option. `examples/tasks.example.txt` shows the useful task shapes:
