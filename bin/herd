@@ -4,6 +4,7 @@
 #   herd [opts] <branch> <prompt> [<branch> <prompt> ...]
 #   herd [opts] -f tasks.txt          # one "branch: prompt" per line, # comments ok
 #   herd ls                           # agents + their status
+#   herd personas [<name>]            # list personas, or print one as a ready-to-paste prompt
 #   herd rm <branch|name>...          # remove worktree, workspace and local branch
 #   herd done [-F] <branch|name>...   # after merge: check PR merged + agent idle + tree clean,
 #                                     # then rm and delete the remote branch (-F skips checks)
@@ -12,19 +13,97 @@
 #   -r <repo>     source checkout (default: git toplevel of $PWD)
 #   -b <ref>      base ref (default: origin/main, fetched first)
 #   -k <kind>     agent kind (default: claude)
+#   -P <persona>  persona prepended to every prompt (name, or a path to a .md file)
 #   -p <ws-id>    parent workspace to group under (default: the one labelled like the repo)
 #   -m <machine>  saved herdr machine (remote paths go under ~/git/wt)
 #   -w            wait for every agent to finish, then print a summary
+#   -n            dry run: print each task's branch, agent name and persona, start nothing
 #   -- <args>     extra args passed to the agent (e.g. -- --model sonnet)
 #
 # Branch names double as agent names: fix/foo-bar -> agent "fix-foo-bar".
+#
+# A task line may name its own persona, which overrides -P:
+#   fix/foo @engineer: Fix X. Run make test, open a PR labelled review-me.
+# Personas are read from $HERD_PERSONA_DIR, <repo>/.herd/personas, ~/.config/herd/personas,
+# then the ones shipped with herd. "@none" runs the prompt bare.
 set -euo pipefail
 
 repo="" base="origin/main" kind="claude" machine="" parent="" parent_ws="" wait=0 force=0 file="" agent_args=()
+persona="" dry=0
 
 die() { echo "herd: $*" >&2; exit 1; }
 h() { if [[ -n $machine ]]; then herdr --machine "$machine" "$@"; else herdr "$@"; fi; }
 agent_name() { local n; n=$(tr 'A-Z/._' 'a-z---' <<<"$1" | tr -cd 'a-z0-9_-'); n=${n#[-_0-9]}; echo "${n:0:32}"; }
+
+# The comment block at the top of this file, minus its leading "# ".
+usage() { awk 'NR > 1 && /^#/ { sub(/^#( |$)/, ""); print; next } NR > 1 { exit }' "$0"; }
+
+# Where this script really lives, following a `make link` symlink.
+script_dir() {
+  local src=$1 dir
+  while [[ -L $src ]]; do
+    dir=$(cd -P "$(dirname "$src")" && pwd)
+    src=$(readlink "$src"); [[ $src == /* ]] || src="$dir/$src"
+  done
+  (cd -P "$(dirname "$src")" && pwd)
+}
+
+# Persona search path, most specific first. $repo may not be known yet; that entry is skipped.
+persona_dirs() {
+  local d; d=$(script_dir "${BASH_SOURCE[0]}")
+  [[ -n ${HERD_PERSONA_DIR:-} ]] && echo "$HERD_PERSONA_DIR"
+  [[ -n ${repo:-} ]] && echo "$repo/.herd/personas"
+  echo "${XDG_CONFIG_HOME:-$HOME/.config}/herd/personas"
+  echo "$d/../personas"             # dev checkout: bin/herd next to personas/
+  echo "$d/../share/herd/personas"  # make install / package
+}
+
+# Resolves a persona name (or a path to a .md file) to a readable file.
+persona_file() {
+  local n=$1 d
+  if [[ $n == *.md || $n == */* ]]; then
+    [[ -f $n ]] || die "no persona file: $n"
+    echo "$n"; return
+  fi
+  while IFS= read -r d; do
+    [[ -f "$d/$n.md" ]] && { echo "$d/$n.md"; return; }
+  done < <(persona_dirs)
+  die "unknown persona: $n (herd personas lists them)"
+}
+
+# Persona text, a rule, then the task — so the agent reads the role before the job.
+compose() {
+  local p=$1 f
+  if [[ -z $p || $p == none ]]; then printf '%s' "$2"; return; fi
+  f=$(persona_file "$p")   # set -e: an unknown persona stops the run here
+  printf '%s\n\n---\n\n# Task\n\n%s\n' "$(cat "$f")" "$2"
+}
+
+# Splits a task key into branch and persona: "fix/foo @engineer" -> fix/foo, engineer.
+# Sets task_branch and task_persona; an unqualified key keeps the run-wide -P.
+split_key() {
+  local key=$1
+  task_branch=$key task_persona=$persona
+  if [[ $key =~ ^[[:space:]]*([^[:space:]@]+)[[:space:]]*@([A-Za-z0-9._/-]+)[[:space:]]*$ ]]; then
+    task_branch=${BASH_REMATCH[1]} task_persona=${BASH_REMATCH[2]}
+  fi
+  task_branch=$(tr -d '[:space:]' <<<"$task_branch")
+}
+
+cmd_personas() {
+  if [[ $# -gt 0 ]]; then compose "$1" "<your task here>"; return; fi
+  local d f n desc
+  { while IFS= read -r d; do
+      [[ -d $d ]] || continue
+      for f in "$d"/*.md; do
+        [[ -f $f ]] || continue
+        n=$(basename "$f" .md)
+        # The "> ..." line under the title doubles as the one-line summary.
+        desc=$(sed -n 's/^> //p' "$f" | head -1)
+        printf '%s\t%s\t%s\n' "$n" "${desc:--}" "$f"
+      done
+    done < <(persona_dirs); } | awk -F'\t' '!seen[$1]++' | column -t -s $'\t'
+}
 
 cmd_ls() {
   h agent list | jq -r '.result.agents[] | [.name // "-", .agent, .agent_status, .cwd] | @tsv' | column -t -s $'\t'
@@ -144,6 +223,7 @@ pick_parent() {
 
 spawn() {
   local branch=$1 prompt=$2 name path out pane
+  prompt=$(compose "$3" "$prompt")
   name=$(agent_name "$branch")
   # shellcheck disable=SC2088  # herdr expands ~ on the remote host
   if [[ -n $machine ]]; then path="~/git/wt/$(basename "$repo")/$name"
@@ -166,16 +246,19 @@ spawn() {
 
 case ${1:-} in
   ls) shift; cmd_ls; exit ;;
+  personas) shift; [[ $# -le 1 ]] || die "personas takes at most one name"
+      repo=$(git rev-parse --show-toplevel 2>/dev/null || true); cmd_personas "$@"; exit ;;
   "done") shift; while getopts "r:b:F" o; do case $o in r) repo=$OPTARG;; b) base=$OPTARG;; F) force=1;; *) exit 2;; esac; done
       shift $((OPTIND-1)); [[ $# -gt 0 ]] || die "done needs a branch or agent name"; cmd_done "$@"; exit ;;
   rm) shift; while getopts "r:m:" o; do case $o in r) repo=$OPTARG;; m) machine=$OPTARG;; *) exit 2;; esac; done
       shift $((OPTIND-1)); [[ $# -gt 0 ]] || die "rm needs a branch or agent name"; cmd_rm "$@"; exit ;;
 esac
 
-while getopts "r:b:k:m:p:f:wh" o; do
+while getopts "r:b:k:m:p:P:f:wnh" o; do
   case $o in
     r) repo=$OPTARG ;; b) base=$OPTARG ;; k) kind=$OPTARG ;; m) machine=$OPTARG ;;
-    p) parent=$OPTARG ;; f) file=$OPTARG ;; w) wait=1 ;; h) sed -n '2,20p' "$0"; exit ;; *) exit 2 ;;
+    p) parent=$OPTARG ;; P) persona=$OPTARG ;; f) file=$OPTARG ;; w) wait=1 ;; n) dry=1 ;;
+    h) usage; exit ;; *) exit 2 ;;
   esac
 done
 shift $((OPTIND-1))
@@ -183,7 +266,7 @@ shift $((OPTIND-1))
 tasks=()
 while [[ $# -gt 0 && $1 != "--" ]]; do
   [[ $# -ge 2 ]] || die "expected <branch> <prompt> pairs"
-  tasks+=("$1" "$2"); shift 2
+  split_key "$1"; tasks+=("$task_branch" "$2" "$task_persona"); shift 2
 done
 [[ ${1:-} == "--" ]] && { shift; agent_args=("$@"); }
 
@@ -191,23 +274,37 @@ if [[ -n $file ]]; then
   while IFS= read -r line; do
     [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
     [[ $line == *:* ]] || die "bad line (want 'branch: prompt'): $line"
-    tasks+=("${line%%:*}" "$(sed 's/^[[:space:]]*//' <<<"${line#*:}")")
+    split_key "${line%%:*}"
+    tasks+=("$task_branch" "$(sed 's/^[[:space:]]*//' <<<"${line#*:}")" "$task_persona")
   done <"$file"
 fi
-[[ ${#tasks[@]} -gt 0 ]] || { sed -n '2,20p' "$0"; exit 2; }
+[[ ${#tasks[@]} -gt 0 ]] || { usage; exit 2; }
 
 if [[ -z $machine ]]; then
   [[ -n $repo ]] || repo=$(git rev-parse --show-toplevel)
   repo=$(cd "$repo" && git rev-parse --show-toplevel)
-  [[ $base == origin/* ]] && git -C "$repo" fetch -q origin "${base#origin/}"
+  [[ $base == origin/* && $dry -eq 0 ]] && git -C "$repo" fetch -q origin "${base#origin/}"
 else
   [[ -n $repo ]] || die "-m needs -r <remote repo path>"
+fi
+
+# Resolve every persona before spawning anything, so a typo can't leave a half-run fan-out.
+for ((i = 2; i < ${#tasks[@]}; i += 3)); do
+  [[ -z ${tasks[i]} || ${tasks[i]} == none ]] || persona_file "${tasks[i]}" >/dev/null
+done
+
+if ((dry)); then
+  for ((i = 0; i < ${#tasks[@]}; i += 3)); do
+    printf '%s\t%s\t%s\t%s\n' "${tasks[i]}" "$(agent_name "${tasks[i]}")" "${tasks[i+2]:-none}" \
+      "$(head -c 60 <<<"${tasks[i+1]}")..."
+  done | column -t -s $'\t'
+  exit
 fi
 
 parent_ws=$(pick_parent)
 [[ -n $parent_ws ]] && echo "grouping under workspace $parent_ws"
 names=()
-for ((i = 0; i < ${#tasks[@]}; i += 2)); do spawn "${tasks[i]}" "${tasks[i+1]}"; done
+for ((i = 0; i < ${#tasks[@]}; i += 3)); do spawn "${tasks[i]}" "${tasks[i+1]}" "${tasks[i+2]}"; done
 
 if ((wait)); then
   echo "waiting for ${#names[@]} agent(s)..."
