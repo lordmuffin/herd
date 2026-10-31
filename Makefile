@@ -12,6 +12,8 @@ test:
 install:
 	install -Dm755 bin/herd $(BIN)/herd
 	install -Dm644 examples/tasks.example.txt $(SHARE)/tasks.example.txt
+	mkdir -p $(SHARE)/personas
+	install -m644 personas/*.md $(SHARE)/personas/
 
 # Dev install: symlink, so edits in this checkout are live.
 link:
