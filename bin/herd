@@ -4,9 +4,17 @@
 #   herd [opts] <branch> <prompt> [<branch> <prompt> ...]
 #   herd [opts] -f tasks.txt          # one "branch: prompt" per line, # comments ok
 #   herd ls                           # agents + their status
-#   herd rm <branch|name>...          # remove worktree, workspace and local branch
-#   herd done [-F] <branch|name>...   # after merge: check PR merged + agent idle + tree clean,
-#                                     # then rm and delete the remote branch (-F skips checks)
+#   herd personas                     # list personas ($HERD_PERSONAS, default ~/git/Notes/80 Personas)
+#   herd rm [-f file] <branch|name>...        # remove worktree, workspace and local branch
+#   herd done [-F] [-f file] <branch|name>... # after merge: check PR merged + agent idle + tree
+#                                     # clean, then rm and delete the remote branch (-F skips checks)
+#                                     # -f takes the same file as spawning (or "-" for stdin); only
+#                                     # the branch before the first ":" is used, so one file can
+#                                     # start a batch and later close it
+#
+# personas (claude agents on this machine only): -P <name> applies to every task; a "branch@name"
+# branch overrides it for one task. <name> is a case-insensitive part of a persona file name
+# (-P forge, fix/foo@grayfield). The file is passed as --append-system-prompt-file.
 #
 # opts:
 #   -r <repo>     source checkout (default: git toplevel of $PWD)
@@ -14,17 +22,53 @@
 #   -k <kind>     agent kind (default: claude)
 #   -p <ws-id>    parent workspace to group under (default: the one labelled like the repo)
 #   -m <machine>  saved herdr machine (remote paths go under ~/git/wt)
+#   -P <persona>  persona for every task (see above)
 #   -w            wait for every agent to finish, then print a summary
 #   -- <args>     extra args passed to the agent (e.g. -- --model sonnet)
 #
 # Branch names double as agent names: fix/foo-bar -> agent "fix-foo-bar".
 set -euo pipefail
 
-repo="" base="origin/main" kind="claude" machine="" parent="" parent_ws="" wait=0 force=0 file="" agent_args=()
+targets=() repo="" base="origin/main" kind="claude" machine="" parent="" parent_ws="" wait=0 force=0 file="" persona="" agent_args=()
 
 die() { echo "herd: $*" >&2; exit 1; }
 h() { if [[ -n $machine ]]; then herdr --machine "$machine" "$@"; else herdr "$@"; fi; }
 agent_name() { local n; n=$(tr 'A-Z/._' 'a-z---' <<<"$1" | tr -cd 'a-z0-9_-'); n=${n#[-_0-9]}; echo "${n:0:32}"; }
+
+# Appends the branch of each "branch[: prompt]" line in $1 ("-" = stdin) to targets.
+read_targets() {
+  local line b
+  [[ $1 == - || -f $1 ]] || die "no such file: $1"
+  while IFS= read -r line; do
+    [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+    b=$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<<"${line%%:*}"); b=${b%%@*}
+    [[ -n $b ]] && targets+=("$b")
+  done < <(if [[ $1 == - ]]; then cat; else cat "$1"; fi)
+}
+
+persona_dir() { echo "${HERD_PERSONAS:-$HOME/git/Notes/80 Personas}"; }
+
+cmd_personas() {
+  local f dir; dir=$(persona_dir)
+  [[ -d $dir ]] || die "no persona dir: $dir"
+  for f in "$dir"/*.md; do basename "$f" .md; done
+}
+
+# Echoes the persona file whose name equals or contains $1 (case-insensitive); dies unless exactly one.
+persona_file() {
+  local q f b dir hits=() exact=""
+  dir=$(persona_dir); [[ -d $dir ]] || die "no persona dir: $dir"
+  q=$(tr 'A-Z' 'a-z' <<<"$1")
+  for f in "$dir"/*.md; do
+    b=$(basename "$f" .md | tr 'A-Z' 'a-z')
+    [[ $b == "$q" || $b == "$q "* ]] && exact=$f   # "kai" picks "Kai - The Kaizen Engineer", not "Kairos"
+    [[ $b == *"$q"* ]] && hits+=("$f")
+  done
+  [[ -n $exact ]] && { echo "$exact"; return; }
+  [[ ${#hits[@]} -gt 0 ]] || die "no persona matching '$1' (see: herd personas)"
+  [[ ${#hits[@]} -eq 1 ]] || die "persona '$1' is ambiguous: $(for f in "${hits[@]}"; do basename "$f" .md; done | paste -sd, -)"
+  echo "${hits[0]}"
+}
 
 cmd_ls() {
   h agent list | jq -r '.result.agents[] | [.name // "-", .agent, .agent_status, .cwd] | @tsv' | column -t -s $'\t'
@@ -140,8 +184,13 @@ pick_parent() {
 }
 
 spawn() {
-  local branch=$1 prompt=$2 name path out pane
+  local branch=$1 prompt=$2 pname=${3:-} name path out pane pfile="" extra=()
   name=$(agent_name "$branch")
+  if [[ -n $pname ]]; then
+    [[ $kind == claude && -z $machine ]] || die "personas need -k claude and no -m"
+    pfile=$(persona_file "$pname")
+    extra=(--append-system-prompt-file "$pfile")
+  fi
   # shellcheck disable=SC2088  # herdr expands ~ on the remote host
   if [[ -n $machine ]]; then path="~/git/wt/$(basename "$repo")/$name"
   else path="$HOME/git/wt/$(basename "$repo")/$name"; fi
@@ -152,27 +201,30 @@ spawn() {
           --path "$path" --label "$name" --no-focus) || die "worktree create failed for $branch"
   pane=$(jq -r '.result.root_pane.pane_id' <<<"$out")
 
-  h agent start "$name" --kind "$kind" --pane "$pane" --timeout 90000 -- ${agent_args[@]+"${agent_args[@]}"} >/dev/null \
+  h agent start "$name" --kind "$kind" --pane "$pane" --timeout 90000 -- ${extra[@]+"${extra[@]}"} ${agent_args[@]+"${agent_args[@]}"} >/dev/null \
     || die "agent start failed for $name (pane $pane) — inspect with: herdr agent read $name"
   # Wait only until the turn has visibly started, so a later `agent wait` can't see the pre-prompt idle.
   h agent prompt "$name" "$prompt" --wait --until working --until blocked --until "done" --timeout 30000 >/dev/null \
     || die "prompt not picked up by $name — inspect with: herdr agent read $name"
-  echo "started $name  ($branch -> $path, pane $pane)"
+  echo "started $name  ($branch -> $path, pane $pane${pfile:+, persona $(basename "$pfile" .md)})"
   names+=("$name")
 }
 
 case ${1:-} in
   ls) shift; cmd_ls; exit ;;
-  "done") shift; while getopts "r:b:F" o; do case $o in r) repo=$OPTARG;; b) base=$OPTARG;; F) force=1;; *) exit 2;; esac; done
-      shift $((OPTIND-1)); [[ $# -gt 0 ]] || die "done needs a branch or agent name"; cmd_done "$@"; exit ;;
-  rm) shift; while getopts "r:m:" o; do case $o in r) repo=$OPTARG;; m) machine=$OPTARG;; *) exit 2;; esac; done
-      shift $((OPTIND-1)); [[ $# -gt 0 ]] || die "rm needs a branch or agent name"; cmd_rm "$@"; exit ;;
+  personas) cmd_personas; exit ;;
+  "done") shift; while getopts "r:b:Ff:" o; do case $o in r) repo=$OPTARG;; b) base=$OPTARG;; F) force=1;; f) file=$OPTARG;; *) exit 2;; esac; done
+      shift $((OPTIND-1)); targets=("$@"); [[ -z $file ]] || read_targets "$file"
+      [[ ${#targets[@]} -gt 0 ]] || die "done needs a branch or agent name (or -f file)"; cmd_done "${targets[@]}"; exit ;;
+  rm) shift; while getopts "r:m:f:" o; do case $o in r) repo=$OPTARG;; m) machine=$OPTARG;; f) file=$OPTARG;; *) exit 2;; esac; done
+      shift $((OPTIND-1)); targets=("$@"); [[ -z $file ]] || read_targets "$file"
+      [[ ${#targets[@]} -gt 0 ]] || die "rm needs a branch or agent name (or -f file)"; cmd_rm "${targets[@]}"; exit ;;
 esac
 
-while getopts "r:b:k:m:p:f:wh" o; do
+while getopts "r:b:k:m:p:f:P:wh" o; do
   case $o in
     r) repo=$OPTARG ;; b) base=$OPTARG ;; k) kind=$OPTARG ;; m) machine=$OPTARG ;;
-    p) parent=$OPTARG ;; f) file=$OPTARG ;; w) wait=1 ;; h) sed -n '2,23p' "$0"; exit ;; *) exit 2 ;;
+    p) parent=$OPTARG ;; f) file=$OPTARG ;; P) persona=$OPTARG ;; w) wait=1 ;; h) sed -n '2,27p' "$0"; exit ;; *) exit 2 ;;
   esac
 done
 shift $((OPTIND-1))
@@ -191,7 +243,7 @@ if [[ -n $file ]]; then
     tasks+=("${line%%:*}" "$(sed 's/^[[:space:]]*//' <<<"${line#*:}")")
   done <"$file"
 fi
-[[ ${#tasks[@]} -gt 0 ]] || { sed -n '2,23p' "$0"; exit 2; }
+[[ ${#tasks[@]} -gt 0 ]] || { sed -n '2,27p' "$0"; exit 2; }
 
 if [[ -z $machine ]]; then
   [[ -n $repo ]] || repo=$(git rev-parse --show-toplevel)
@@ -204,7 +256,11 @@ fi
 parent_ws=$(pick_parent)
 [[ -n $parent_ws ]] && echo "grouping under workspace $parent_ws"
 names=()
-for ((i = 0; i < ${#tasks[@]}; i += 2)); do spawn "${tasks[i]}" "${tasks[i+1]}"; done
+for ((i = 0; i < ${#tasks[@]}; i += 2)); do
+  b=${tasks[i]} p=$persona
+  [[ $b == *@* ]] && { p=${b#*@}; b=${b%%@*}; }
+  spawn "$b" "${tasks[i+1]}" "$p"
+done
 
 if ((wait)); then
   echo "waiting for ${#names[@]} agent(s)..."

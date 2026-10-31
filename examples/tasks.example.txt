@@ -6,7 +6,7 @@
 #
 # Run:   herd -f ~/.config/herd/tasks.example.txt        (add -w to wait for all of them)
 # Check: herd ls
-# Clean: herd rm <branch>   (after the PR merges)
+# Clean: herd done -f <this file>   (after the PRs merge; or herd rm <branch> to discard)
 
 # A scoped fix that goes all the way to a PR (the agent follows CLAUDE.md's PR + review-me rules)
 fix/cnpg-offsite-backup: CLAUDE.md says no CNPG database has an offsite copy because barman only writes to SeaweedFS on the NAS. Read docs/postgres-cnpg.md §Backups and apps/storage/postgres-cluster/, then add a second barman target for Backblaze B2 using a OnePasswordItem for the credentials. Follow TDD.md, run make test, open a PR and label it review-me.

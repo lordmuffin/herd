@@ -7,9 +7,15 @@ then clean them up once their PRs merge.
 herd fix/foo "Fix X. Run make test, open a PR labelled review-me."   # one task
 herd -f tasks.txt                                                    # a batch, "branch: prompt" per line
 herd ls                                                              # agents and their status
+herd -P forge fix/foo "..."                                          # run the agent as a persona (herd personas lists them)
+herd fix/foo@grayfield "..."                                         # persona for one task; also works as "fix/foo@grayfield: ..." in a task file
 herd done fix/foo                                                    # after merge: remove worktree + branches
+herd done -f tasks.txt                                               # close a whole batch with the same file
 herd rm fix/foo                                                      # discard a stream (no checks)
+herd rm -f tasks.txt                                                 # discard a whole batch
 ```
+
+Personas are markdown files in `$HERD_PERSONAS` (default `~/git/Notes/80 Personas`), matched by a case-insensitive part of the file name and passed to claude as `--append-system-prompt-file`. Claude agents on this machine only.
 
 `herd -h` lists every option. `examples/tasks.example.txt` shows the three useful task shapes:
 plan-only, investigate-only, and fix-to-PR.
@@ -32,6 +38,11 @@ For each task, `herd`:
 
 It then removes the worktree, closes the workspace, and deletes the local and remote branch.
 `-F` skips the checks.
+
+Both `done` and `rm` accept `-f <file>` (or `-f -` for stdin). It takes the same task file used to
+start the batch; only the branch before the first `:` is read, so the prompts are ignored. Streams
+that aren't ready are skipped with a reason, and the rest are still cleaned up, so rerun
+`herd done -f tasks.txt` as PRs merge.
 
 ## Requirements
 
