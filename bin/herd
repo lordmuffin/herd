@@ -66,7 +66,7 @@ forgejo_keys() {
            "$HOME/Library/Application Support/forgejo-cli/keys.json"; do
     [[ -f $c ]] && { echo "$c"; return; }
   done
-  die "no forgejo-cli keys.json (run: fj auth login)"
+  die "no forgejo-cli keys.json (run: fj auth login, or fj auth add-token)"
 }
 
 # Forgejo API call authenticated with fj's stored token for the origin host.
@@ -77,7 +77,7 @@ forgejo() {
   host=$(sed -E 's#^[a-z+]+://([^@/]+@)?([^:/]+).*#\2#; s#^[^@]+@([^:]+):.*#\1#' <<<"$url")
   host=$(jq -r --arg h "$host" '.aliases[$h] // $h' "$keys")
   tok=$(jq -r --arg h "$host" '.hosts[$h].token // empty' "$keys")
-  [[ -n $tok ]] || die "no fj token for $host (run: fj auth login)"
+  [[ -n $tok ]] || die "no fj token for $host (run: fj auth login, or fj auth add-token)"
   repo_slug=$(sed -E 's#\.git$##; s#.*[:/]([^/]+/[^/]+)$#\1#' <<<"$url")
   curl -sf -H "Authorization: token $tok" "https://$host/api/v1/repos/$repo_slug/$1"
 }

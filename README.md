@@ -38,8 +38,13 @@ It then removes the worktree, closes the workspace, and deletes the local and re
 - [herdr](https://herdr.dev), run from inside a Herdr pane;
 - `bash`, `git`, `jq` and `curl`;
 - `column` (from util-linux);
-- for `herd done`, a Forgejo login via [forgejo-cli](https://codeberg.org/forgejo-contrib/forgejo-cli)
-  (`fj auth login`). The token is read from `~/.local/share/forgejo-cli/keys.json` at runtime.
+- for `herd done`, a Forgejo login via [forgejo-cli](https://codeberg.org/forgejo-contrib/forgejo-cli).
+  `fj auth login` needs an OAuth app registered on the instance; where there isn't one, create a
+  token at `/user/settings/applications` (`read:repository` covers `herd done`; `write:repository`
+  if the agents open their PRs with `fj` too) and add it with
+  `fj auth add-token` (`add-token` refuses to overwrite, so `fj auth logout <host>` first to
+  replace a dead one). The token is read from forgejo-cli's `keys.json` at runtime — the XDG
+  data dir on Linux, `Application Support` on macOS.
 
 ## Install
 
