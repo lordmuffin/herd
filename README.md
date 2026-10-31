@@ -5,17 +5,26 @@ then clean them up once their PRs merge.
 
 ```bash
 herd -P engineer fix/foo "Fix X. Label the PR review-me."   # one task, with a persona
-herd -f tasks.txt                                          # a batch, "branch [@persona]: prompt" per line
-herd -n -f tasks.txt                                       # dry run: what would start, and as what
+herd                                                       # a batch from Tasks.herd in the repo root
+herd -f other.herd                                         # a batch from any other file
+herd -n                                                    # dry run: what would start, and as what
 herd ls                                                    # agents and their status
 herd done fix/foo                                          # after merge: remove worktree + branches
-herd done -f tasks.txt                                      # close a whole batch with the same file
+herd done                                                  # close the whole Tasks.herd batch
 herd rm fix/foo                                            # discard a stream (no checks)
-herd rm -f tasks.txt                                       # discard a whole batch
+herd rm -f Tasks.herd                                      # discard a whole batch
 ```
 
-`herd -h` lists every option. `examples/tasks.example.txt` shows the useful task shapes:
+`herd -h` lists every option. `examples/Tasks.example.herd` shows the useful task shapes:
 plan-only, investigate-only, fix-to-PR, docs-only and review-only.
+
+## Tasks.herd
+
+`Tasks.herd` in the repo root is the standard task file, one `branch [@persona]: prompt` per
+line. With no tasks on the command line, `herd` and `herd done` read it and print its path;
+`-f` or explicit branches take precedence, and with no `Tasks.herd` `herd` prints its usage.
+`herd rm` never picks it up on its own, because it deletes without checks: name the file
+with `-f`.
 
 ## What it does
 
