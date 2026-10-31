@@ -38,8 +38,13 @@ It then removes the worktree, closes the workspace, and deletes the local and re
 - [herdr](https://herdr.dev), run from inside a Herdr pane;
 - `bash`, `git`, `jq` and `curl`;
 - `column` (from util-linux);
-- for `herd done`, a Forgejo login via [forgejo-cli](https://codeberg.org/forgejo-contrib/forgejo-cli)
-  (`fj auth login`). The token is read from `~/.local/share/forgejo-cli/keys.json` at runtime.
+- for `herd done`, a Forgejo login via [forgejo-cli](https://codeberg.org/forgejo-contrib/forgejo-cli).
+  `fj auth login` needs an OAuth app registered on the instance; where there isn't one, create a
+  token at `/user/settings/applications` (`read:repository` covers `herd done`; `write:repository`
+  if the agents open their PRs with `fj` too) and add it with
+  `fj auth add-token` (`add-token` refuses to overwrite, so `fj auth logout <host>` first to
+  replace a dead one). The token is read from forgejo-cli's `keys.json` at runtime — the XDG
+  data dir on Linux, `Application Support` on macOS.
 
 ## Install
 
@@ -58,6 +63,20 @@ make link            # make uninstall to remove
 
 Use one of the two per machine. `~/.local/bin` usually comes first in `PATH`, so a symlink
 there hides the packaged `/usr/bin/herd`.
+
+**macOS** — `makepkg` is Arch-only, and `make install` needs GNU coreutils (BSD `install` has
+no `-D`), so use the dev checkout:
+
+```bash
+brew install bash jq shellcheck
+git clone ssh://git@git-ssh.apj.dev/lordmuffin/herd.git && cd herd
+make link            # git pull to update
+```
+
+Homebrew's bash is required: `herd` uses bash 4+ features and macOS ships 3.2 at `/bin/bash`.
+Stock `/usr/bin/column` and `curl` are fine. For `herd done`, add `brew install forgejo-cli`;
+its token lands in `~/Library/Application Support/forgejo-cli.forgejo-cli/keys.json` (the
+doubled name is the `directories` crate's macOS layout), which `herd` checks after the XDG path.
 
 ## Develop
 
