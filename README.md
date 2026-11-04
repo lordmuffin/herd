@@ -71,6 +71,21 @@ land in the PR. `herd done <branch>` cleans up as usual once it merges. `verify:
 unattended in the worktree, outside the agent's permission prompts. The planner writes them,
 so read them with `-n` when that matters. `herd plan` runs on this machine only (no `-m`).
 
+**Running unattended.** A plan only runs on its own if its agent doesn't stop to ask
+permission. Under Claude's default mode, the first shell command that isn't on its allowlist
+blocks the stage, and herd stops there and waits for `-R`. Pass the agent a permission mode
+after `--`:
+
+```bash
+herd plan feat/x PLAN.md -- --permission-mode auto   # Claude's classifier answers the prompts
+```
+
+`--permission-mode acceptEdits` with `--allowedTools` works too, but the allowlist has to cover
+every command a stage might run, compound ones included. A narrow list still blocks. Avoid
+`bypassPermissions` outside a throwaway repo. Before the first run in a new repo, open Claude
+there once and accept its folder trust prompt: an agent still sitting at that prompt fails to
+start, and herd stops before stage 1.
+
 ## Personas
 
 A persona is a plain-markdown prompt that says how the agent should work — what it reads first,
