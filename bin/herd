@@ -280,7 +280,11 @@ pick_parent() {
       echo "$w"; return
     fi
   done
-  if [[ -n ${HERDR_WORKSPACE_ID:-} && -z $machine && $PWD == "$repo"* ]]; then
+  # The current workspace only if it is this repo's: herdr builds the worktree from the parent's
+  # repo, so a pane that merely cd'd into another checkout would put the worktree in the wrong one.
+  if [[ -n ${HERDR_WORKSPACE_ID:-} && -z $machine ]] \
+      && h workspace list | jq -e --arg w "$HERDR_WORKSPACE_ID" --arg r "$repo" \
+           'any(.result.workspaces[]; .workspace_id == $w and .worktree.repo_root == $r)' >/dev/null; then
     echo "$HERDR_WORKSPACE_ID"
   fi
 }
@@ -365,8 +369,16 @@ load_state() {
 
 # Waits for the agent's turn to end. Blocked means a human has to answer it, so herd stops there.
 await_agent() {
-  local s
-  s=$(h agent wait "$wt_name" | jq -r '.result.agent.agent_status') || s="?"
+  local s tries=0
+  while :; do
+    s=$(h agent wait "$wt_name" | jq -r '.result.agent.agent_status') || s="?"
+    [[ $s == blocked ]] || break
+    # Detection can flash blocked as a turn ends; only a block that is still there 10s later counts.
+    sleep 10
+    s=$(h agent get "$wt_name" | jq -r '.result.agent.agent_status') || s="?"
+    [[ $s == blocked ]] && break
+    ((++tries < 5)) || break
+  done
   if [[ $s == blocked ]]; then
     # Planning and fix-up keep their status, so -R re-checks the same thing (and spends no extra retry).
     [[ $status != running ]] || { status=blocked; save_state; }
