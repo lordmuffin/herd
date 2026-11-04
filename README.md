@@ -13,6 +13,8 @@ herd done fix/foo                                          # after merge: remove
 herd done                                                  # close the whole Tasks.herd batch
 herd rm fix/foo                                            # discard a stream (no checks)
 herd rm -f Tasks.herd                                      # discard a whole batch
+herd plan feat/big PLAN.md                                 # one plan, run stage by stage to one PR
+herd plan -R feat/big                                      # resume a plan that stopped
 ```
 
 `herd -h` lists every option. `examples/Tasks.example.herd` shows the useful task shapes:
@@ -36,6 +38,39 @@ For each task, `herd`:
 3. Starts the agent (`claude` by default, `-k` for another kind) and sends it the prompt — the
    persona first if one is set, then the task — and waits until it has begun.
 
+## Plans
+
+`herd plan` takes one complete plan and runs it as a chain of stages that build on each
+other, in one worktree, on one branch, ending in one PR:
+
+```bash
+herd plan feat/export-csv PLAN.md          # a file
+herd plan -v "make test" feat/x - <PLAN.md # stdin, with a default verify command
+herd plan -n feat/x PLAN.md                # stop once the stages are written, to review them
+herd plan -R feat/x                        # resume after a block, a failed gate, or ^C
+```
+
+1. **Planning.** A `planner` turn reads the plan and the code and writes
+   `.herd/run/stages.md`: `## Stage N: title` sections, each with a `verify:` command and a
+   self-contained prompt. If the plan already has those headings, herd uses it as is and skips
+   this turn (`examples/plan.example.md` shows the format).
+2. **Stages.** Each stage starts a fresh agent session (`/clear` for claude, `/new` for
+   codex), so a long plan never runs on a compacted context. The agent gets the stage prompt,
+   with the `-P` persona (default `engineer`), and is told to read `.herd/run/PROGRESS.md`,
+   commit its work and append a `## Stage N` handoff section to it.
+3. **Gate.** When the turn ends, herd checks the handoff section exists, the tree is clean,
+   and the stage's `verify:` command (or `-v`) passes. If the gate fails, herd sends one
+   fix-up turn with the failures. If it fails a second time, herd stops. The last stage must
+   also push and open the PR, and with a forgejo-cli login herd checks that the PR exists.
+4. **Stops.** A blocked agent, or a stage that fails twice, stops the run with the reason;
+   fix it in the pane (or edit `stages.md`), then `herd plan -R <branch>`. The step state is in
+   `.herd/run/state`, so `-R` re-checks the stage where it stopped and carries on.
+
+`.herd/run/` is added to the repo's `info/exclude`, so the plan, stages and handoff notes never
+land in the PR. `herd done <branch>` cleans up as usual once it merges. `verify:` commands run
+unattended in the worktree, outside the agent's permission prompts. The planner writes them,
+so read them with `-n` when that matters. `herd plan` runs on this machine only (no `-m`).
+
 ## Personas
 
 A persona is a plain-markdown prompt that says how the agent should work — what it reads first,
@@ -51,7 +86,7 @@ herd personas              # name, one-line summary, and which file won
 herd personas engineer     # print the composed prompt (pipe it into any agent, herd or not)
 ```
 
-Five ship with `herd`, each self-contained and agent-agnostic:
+Six ship with `herd`, each self-contained and agent-agnostic:
 
 | persona | leaves behind | touches code |
 | --- | --- | --- |
@@ -60,6 +95,7 @@ Five ship with `herd`, each self-contained and agent-agnostic:
 | `researcher` | `FINDINGS.md`, with file:line anchors | no |
 | `reviewer` | `REVIEW.md`, findings ranked by consequence | no |
 | `writer` | docs edits and a PR | docs only |
+| `planner` | `.herd/run/stages.md` for `herd plan` | no |
 
 In a task file, `@persona` on a line overrides `-P`, and `@none` runs the prompt bare:
 

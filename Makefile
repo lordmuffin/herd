@@ -12,6 +12,7 @@ test:
 install:
 	install -Dm755 bin/herd $(BIN)/herd
 	install -Dm644 examples/Tasks.example.herd $(SHARE)/Tasks.example.herd
+	install -Dm644 examples/plan.example.md $(SHARE)/plan.example.md
 	mkdir -p $(SHARE)/personas
 	install -m644 personas/*.md $(SHARE)/personas/
 

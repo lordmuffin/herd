@@ -4,6 +4,17 @@
 #   herd [opts] <branch> <prompt> [<branch> <prompt> ...]
 #   herd [opts] [-f Tasks.herd]       # one "branch: prompt" per line, # comments ok; with no
 #                                     # tasks given, reads Tasks.herd from the repo root
+#   herd plan [opts] [-v cmd] <branch> <plan.md|-|text>
+#                                     # run one complete plan as a chain of stages in one worktree:
+#                                     # a planner turn splits it into .herd/run/stages.md (skipped
+#                                     # if the plan already has "## Stage N: title" headings), then
+#                                     # each stage gets a fresh session, hands off through
+#                                     # .herd/run/PROGRESS.md and must pass its gate (handoff written,
+#                                     # tree committed, its "verify:" command or -v passing) before
+#                                     # the next starts; one fix-up turn on a miss. The last stage
+#                                     # pushes and opens the PR. -P sets the stage persona (default
+#                                     # engineer); -n stops once the stages are written
+#   herd plan -R <branch>             # resume a plan stopped by a block, a failed gate or ^C
 #   herd ls                           # agents + their status
 #   herd personas [<name>]            # list personas, or print one as a ready-to-paste prompt
 #   herd rm [-f file] <branch|name>...        # remove worktree, workspace and local branch
@@ -274,27 +285,288 @@ pick_parent() {
   fi
 }
 
-spawn() {
-  local branch=$1 prompt=$2 name path out pane
-  prompt=$(compose "$3" "$prompt")
-  name=$(agent_name "$branch")
+# Creates the branch's worktree and workspace and starts an agent in it, without a prompt.
+# Sets wt_name, wt_path and wt_pane.
+create_agent() {
+  local branch=$1 out
+  wt_name=$(agent_name "$branch")
   # shellcheck disable=SC2088  # herdr expands ~ on the remote host
-  if [[ -n $machine ]]; then path="~/git/wt/$(basename "$repo")/$name"
-  else path="$HOME/git/wt/$(basename "$repo")/$name"; fi
+  if [[ -n $machine ]]; then wt_path="~/git/wt/$(basename "$repo")/$wt_name"
+  else wt_path="$HOME/git/wt/$(basename "$repo")/$wt_name"; fi
 
   local src=(--cwd "$repo")
   [[ -n $parent_ws ]] && src=(--workspace "$parent_ws")
   out=$(h worktree create "${src[@]}" --branch "$branch" --base "$base" \
-          --path "$path" --label "$name" --no-focus) || die "worktree create failed for $branch"
-  pane=$(jq -r '.result.root_pane.pane_id' <<<"$out")
+          --path "$wt_path" --label "$wt_name" --no-focus) || die "worktree create failed for $branch"
+  wt_pane=$(jq -r '.result.root_pane.pane_id' <<<"$out")
 
-  h agent start "$name" --kind "$kind" --pane "$pane" --timeout 90000 -- "${agent_args[@]}" >/dev/null \
-    || die "agent start failed for $name (pane $pane) — inspect with: herdr agent read $name"
-  # Wait only until the turn has visibly started, so a later `agent wait` can't see the pre-prompt idle.
-  h agent prompt "$name" "$prompt" --wait --until working --until blocked --until "done" --timeout 30000 >/dev/null \
-    || die "prompt not picked up by $name — inspect with: herdr agent read $name"
-  echo "started $name  ($branch -> $path, pane $pane)"
-  names+=("$name")
+  h agent start "$wt_name" --kind "$kind" --pane "$wt_pane" --timeout 90000 -- "${agent_args[@]}" >/dev/null \
+    || die "agent start failed for $wt_name (pane $wt_pane) — inspect with: herdr agent read $wt_name"
+}
+
+# Wait only until the turn has visibly started, so a later `agent wait` can't see the pre-prompt idle.
+send_prompt() {
+  h agent prompt "$1" "$2" --wait --until working --until blocked --until "done" --timeout 30000 >/dev/null \
+    || die "prompt not picked up by $1 — inspect with: herdr agent read $1"
+}
+
+spawn() {
+  local branch=$1 prompt
+  prompt=$(compose "$3" "$2")
+  create_agent "$branch"
+  send_prompt "$wt_name" "$prompt"
+  echo "started $wt_name  ($branch -> $wt_path, pane $wt_pane)"
+  names+=("$wt_name")
+}
+
+# --- herd plan: one plan, run as a chain of stages in one worktree ---------------------------
+# State lives in <worktree>/.herd/run/ (git-ignored through info/exclude):
+#   plan.md      the plan as given          stages.md  "## Stage N: title" sections
+#   PROGRESS.md  the agents' handoff notes  state      stage + status, so -R can resume
+
+# Prints a field of stage $2 from stages file $1: title, verify or body; or, with $2=0, the count.
+# The first "verify:" line of a stage is its verify command, and is not part of its body.
+stage_field() {
+  awk -v want="$2" -v field="${3:-count}" '
+    /^## Stage [0-9]+/ {
+      n++; skipped = 0
+      if (n == want && field == "title") { t = $0; sub(/^## Stage [0-9]+:?[ \t]*/, "", t); print t }
+      next
+    }
+    n != want || n == 0 { next }
+    /^verify:/ && !skipped { skipped = 1; if (field == "verify") { v = $0; sub(/^verify:[ \t]*/, "", v); print v }; next }
+    field == "body" { print }
+    END { if (field == "count") print n + 0 }' "$1"
+}
+
+stage_table() {
+  local f=$1 n i v
+  n=$(stage_field "$f" 0)
+  for ((i = 1; i <= n; i++)); do
+    v=$(stage_field "$f" "$i" verify)
+    printf '%s\t%s\tverify: %s\n' "$i" "$(stage_field "$f" "$i" title)" "${v:-${plan_verify:-(none)}}"
+  done | column -t -s $'\t'
+}
+
+save_state() {
+  printf '%s=%s\n' stage "$stage" status "$status" persona "$persona" kind "$kind" \
+    verify "$plan_verify" base "$base" >"$run/state"
+}
+
+load_state() {
+  local k v
+  while IFS='=' read -r k v; do
+    case $k in
+      stage) stage=$v ;; status) status=$v ;; persona) persona=$v ;; kind) kind=$v ;;
+      verify) plan_verify=$v ;; base) base=$v ;;
+    esac
+  done <"$run/state"
+}
+
+# Waits for the agent's turn to end. Blocked means a human has to answer it, so herd stops there.
+await_agent() {
+  local s
+  s=$(h agent wait "$wt_name" | jq -r '.result.agent.agent_status') || s="?"
+  if [[ $s == blocked ]]; then
+    # Planning and fix-up keep their status, so -R re-checks the same thing (and spends no extra retry).
+    [[ $status != running ]] || { status=blocked; save_state; }
+    echo "herd: $wt_name is blocked $(if ((stage)); then echo "in stage $stage"; else echo "while planning"; fi)" \
+      "— answer it in its pane, then: herd plan -R $plan_branch" >&2
+    return 1
+  fi
+}
+
+# Clears the agent's conversation so each stage starts from PROGRESS.md, not a growing context.
+fresh_session() {
+  local cmd
+  case $kind in
+    claude) cmd=/clear ;; codex) cmd=/new ;;
+    *) echo "herd: no fresh-session command known for '$kind', continuing in the same session" >&2; return ;;
+  esac
+  h agent prompt "$wt_name" "$cmd" >/dev/null || die "could not clear $wt_name's session"
+  sleep 3
+}
+
+planner_prompt() {
+  cat <<EOF
+Split the plan in .herd/run/plan.md into sequential stages. Other agents will execute them one at
+a time in this worktree, each in a fresh session that knows only the stage you write and the notes
+earlier stages leave in .herd/run/PROGRESS.md. Read the plan and the code it touches first.
+
+Write .herd/run/stages.md in exactly this format, with nothing before the first stage:
+
+## Stage 1: <short title>
+verify: <one shell command, run from the worktree root, that exits 0 only when this stage is done>
+
+<the full prompt for this stage, as many lines as it needs>
+
+## Stage 2: <short title>
+verify: ...
+
+Use "## Stage" headings only for stages, never inside a prompt. herd adds the handoff, commit and
+PR instructions to every stage itself, so leave those out. Change no code and commit nothing; stop
+once .herd/run/stages.md is written.
+EOF
+}
+
+stage_prompt() {
+  local v=$1 last=$2 title body
+  title=$(stage_field "$run/stages.md" "$stage" title)
+  body=$(stage_field "$run/stages.md" "$stage" body)
+  cat <<EOF
+This is stage $stage of $total of a multi-stage plan, on branch $plan_branch in this worktree.
+Earlier stages are committed here already, but you have no memory of them.
+
+Before you start, read .herd/run/PROGRESS.md for what earlier stages did and left for you, and
+.herd/run/plan.md if you need the bigger picture. Do only this stage; later stages do the rest.
+
+When you are done:
+1. $(if [[ -n $v ]]; then echo "Run \`$v\` from the worktree root and get it passing."; else echo "Run the project's checks and get them passing."; fi)
+2. Commit your work with a real message, and leave no uncommitted changes (.herd/run/ is git-ignored).
+3. Append a section headed "## Stage $stage: $title" to .herd/run/PROGRESS.md: what you changed,
+   the decisions you made, and anything the next stage needs to know.
+4. $(if ((last)); then echo "This is the final stage: push the branch and open a PR into ${base#origin/}, with a body that summarises every stage from PROGRESS.md."; else echo "Do not push or open a PR; the final stage does that. Then stop."; fi)
+
+herd checks all of this before it starts the next stage.
+
+## Stage $stage: $title
+
+$body
+EOF
+}
+
+# Checks that stage $stage is really finished. Sets gate_msg to what is missing.
+stage_gate() {
+  local v=$1 last=$2 out dirty head remote
+  gate_msg=""
+  grep -Eq "^## Stage $stage([^0-9]|$)" "$run/PROGRESS.md" 2>/dev/null \
+    || gate_msg+="- .herd/run/PROGRESS.md has no \"## Stage $stage\" section."$'\n'
+  dirty=$(git -C "$wt_path" status --porcelain)
+  [[ -z $dirty ]] || gate_msg+="- There are uncommitted changes:"$'\n'"$dirty"$'\n'
+  if [[ -n $v ]]; then
+    echo "  verify: $v"
+    out=$(cd "$wt_path" && bash -c "$v" 2>&1) \
+      || gate_msg+="- \`$v\` failed. The end of its output:"$'\n'"$(tail -40 <<<"$out")"$'\n'
+  fi
+  if ((last)); then
+    head=$(git -C "$wt_path" rev-parse HEAD)
+    remote=$(git -C "$wt_path" ls-remote origin "refs/heads/$plan_branch" | cut -f1)
+    [[ $head == "$remote" ]] || gate_msg+="- The branch is not pushed to origin at HEAD."$'\n'
+    # Only checked where herd done could check it too, i.e. with a forgejo-cli login.
+    if (forgejo_keys >/dev/null 2>&1) && ! (forgejo "pulls/${base#origin/}/$plan_branch" >/dev/null 2>&1); then
+      gate_msg+="- There is no PR from $plan_branch into ${base#origin/}."$'\n'
+    fi
+  fi
+  [[ -z $gate_msg ]]
+}
+
+planner_gate() {
+  gate_msg=""
+  if [[ ! -s $run/stages.md ]]; then gate_msg="- .herd/run/stages.md does not exist or is empty."
+  elif [[ $(stage_field "$run/stages.md" 0) -eq 0 ]]; then gate_msg="- .herd/run/stages.md has no \"## Stage N: title\" headings."
+  fi
+  [[ -z $gate_msg ]]
+}
+
+# Runs the plan from wherever its state says it is. Every step saves state first, so an
+# interrupt, a blocked agent or a failed gate can all be picked up with -R.
+drive_plan() {
+  local v last
+  if [[ $status == planning || $status == replanning ]]; then
+    await_agent || exit 3
+    if ! planner_gate; then
+      [[ $status == planning ]] || { status=failed; save_state; die "planner did not write usable stages:"$'\n'"$gate_msg"; }
+      status=replanning; save_state
+      send_prompt "$wt_name" "herd could not use your stages file:"$'\n'"$gate_msg"$'\n'"Write it in the format you were given, then stop."
+      drive_plan; return
+    fi
+    stage=1 status=pending; save_state
+    echo "planned $(stage_field "$run/stages.md" 0) stage(s):"; stage_table "$run/stages.md" | sed 's/^/  /'
+    if ((dry)); then echo "stopping before stage 1 (-n); edit $run/stages.md if you like, then: herd plan -R $plan_branch"; exit; fi
+  fi
+
+  total=$(stage_field "$run/stages.md" 0)
+  while ((stage <= total)); do
+    v=$(stage_field "$run/stages.md" "$stage" verify); v=${v:-$plan_verify}
+    last=$((stage == total))
+    case $status in
+      verified) stage=$((stage + 1)) status=pending; save_state; continue ;;
+      pending)
+        fresh_session
+        status=running; save_state
+        send_prompt "$wt_name" "$(compose "$persona" "$(stage_prompt "$v" "$last")")"
+        echo "stage $stage/$total: $(stage_field "$run/stages.md" "$stage" title)" ;;
+    esac
+    # running, fixing, blocked or failed: let the turn end, then check the work.
+    await_agent || exit 3
+    if stage_gate "$v" "$last"; then
+      status=verified; save_state; echo "  stage $stage verified"; continue
+    fi
+    if [[ $status == fixing ]]; then
+      status=failed; save_state
+      echo "herd: stage $stage still fails after a fix-up turn:" >&2; sed 's/^/    /' <<<"$gate_msg" >&2
+      echo "herd: fix it in the pane (or edit $run/stages.md), then: herd plan -R $plan_branch" >&2
+      exit 1
+    fi
+    echo "  stage $stage not done yet, sending a fix-up turn:"; sed 's/^/    /' <<<"$gate_msg"
+    status=fixing; save_state
+    send_prompt "$wt_name" "Stage $stage of $total is not done yet. herd checked and found:"$'\n\n'"$gate_msg"$'\n'"Fix these, then make sure the \"## Stage $stage\" section of .herd/run/PROGRESS.md is up to date, and stop."
+  done
+  status=complete; save_state
+  echo "plan complete: $total stage(s) on $plan_branch. After the PR merges: herd done $plan_branch"
+}
+
+cmd_plan() {
+  [[ -z $machine ]] || die "plan runs its checks in the worktree, so it works on this machine only (no -m)"
+  [[ -n $repo ]] || repo=$(git rev-parse --show-toplevel)
+  repo=$(cd "$repo" && git rev-parse --show-toplevel)
+  local text staged=0 tmp
+  if ((resume)); then
+    find_wt "$plan_branch" || exit 1
+    wt_name=$(agent_name "$plan_branch") wt_path=$path run="$path/.herd/run"
+    [[ -f $run/state ]] || die "no plan run in $path"
+    load_state
+    [[ $status != complete ]] || { echo "plan on $plan_branch is already complete"; return; }
+    echo "resuming $plan_branch at stage $stage ($status)"
+    drive_plan; return
+  fi
+
+  if [[ $plan_src == - ]]; then text=$(cat)
+  elif [[ -f $plan_src ]]; then text=$(cat "$plan_src")
+  else text=$plan_src; fi
+  [[ -n ${text//[[:space:]]/} ]] || die "the plan is empty"
+  grep -Eq '^## Stage [0-9]+' <<<"$text" && staged=1
+  persona=${persona:-engineer}
+  [[ $persona == none ]] || persona_file "$persona" >/dev/null
+  ((staged)) || persona_file planner >/dev/null
+
+  if ((staged && dry)); then
+    tmp=$(mktemp); printf '%s\n' "$text" >"$tmp"
+    echo "$plan_branch ($(agent_name "$plan_branch")), persona $persona, $(stage_field "$tmp" 0) stage(s):"
+    stage_table "$tmp" | sed 's/^/  /'; rm -f "$tmp"; return
+  fi
+
+  [[ $base == origin/* ]] && git -C "$repo" fetch -q origin "${base#origin/}"
+  parent_ws=$(pick_parent)
+  create_agent "$plan_branch"
+  run="$wt_path/.herd/run"
+  mkdir -p "$run"
+  local exclude; exclude="$(git -C "$wt_path" rev-parse --path-format=absolute --git-common-dir)/info/exclude"
+  mkdir -p "$(dirname "$exclude")"
+  grep -qxF '.herd/run/' "$exclude" 2>/dev/null || echo '.herd/run/' >>"$exclude"
+  printf '%s\n' "$text" >"$run/plan.md"
+  echo "started $wt_name  ($plan_branch -> $wt_path, pane $wt_pane)"
+
+  if ((staged)); then
+    cp "$run/plan.md" "$run/stages.md"
+    stage=1 status=pending; save_state
+    echo "plan has $(stage_field "$run/stages.md" 0) stage(s) already, skipping the planner"
+  else
+    stage=0 status=planning; save_state
+    send_prompt "$wt_name" "$(compose planner "$(planner_prompt)")"
+    echo "planning: the planner is splitting the plan into stages"
+  fi
+  drive_plan
 }
 
 case ${1:-} in
@@ -305,6 +577,21 @@ case ${1:-} in
       shift $((OPTIND-1)); targets=("$@"); [[ -n $file || $# -gt 0 ]] || file=$(default_file)
       [[ -z $file ]] || read_targets "$file"
       [[ ${#targets[@]} -gt 0 ]] || die "done needs a branch or agent name (or -f file, or a Tasks.herd)"; cmd_done "${targets[@]}"; exit ;;
+  plan) shift; resume=0 plan_verify=""
+      while getopts "r:b:k:m:p:P:v:nRh" o; do case $o in
+        r) repo=$OPTARG;; b) base=$OPTARG;; k) kind=$OPTARG;; m) machine=$OPTARG;; p) parent=$OPTARG;;
+        P) persona=$OPTARG;; v) plan_verify=$OPTARG;; n) dry=1;; R) resume=1;; h) usage; exit;; *) exit 2;; esac; done
+      shift $((OPTIND-1)); plan_branch=$(tr -d '[:space:]' <<<"${1:-}")
+      [[ -n $plan_branch ]] || die "plan needs a branch: herd plan <branch> <plan.md|-|text>, or herd plan -R <branch>"
+      shift
+      if ((resume)); then [[ $# -eq 0 ]] || die "plan -R takes only the branch"
+      else
+        [[ $# -ge 1 && $1 != "--" ]] || die "plan needs a plan: a file, - for stdin, or the text itself"
+        plan_src=$1; shift
+        [[ ${1:-} != "--" ]] || { shift; agent_args=("$@"); set --; }
+        [[ $# -eq 0 ]] || die "plan takes one branch and one plan"
+      fi
+      cmd_plan; exit ;;
   rm) shift; while getopts "r:m:f:" o; do case $o in r) repo=$OPTARG;; m) machine=$OPTARG;; f) file=$OPTARG;; *) exit 2;; esac; done
       shift $((OPTIND-1)); targets=("$@"); [[ -z $file ]] || read_targets "$file"
       [[ ${#targets[@]} -gt 0 ]] || die "rm needs a branch or agent name (or -f file)"; cmd_rm "${targets[@]}"; exit ;;
