@@ -1,0 +1,9 @@
+● Started the lab driver in the background and a Monitor on its log. It takes about 7 minutes;
+  I'll pick it up when the Monitor reports it finished.
+
+✻ Crunched for 11s · done 6:25 PM · 1 shell, 1 monitor still running
+
+────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 shell, 1 monitor · ↓ to manage

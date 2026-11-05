@@ -6,7 +6,8 @@ SHARE  := $(DESTDIR)$(PREFIX)/share/herd
 
 test:
 	bash -n bin/herd
-	shellcheck -S warning bin/herd
+	shellcheck -S warning bin/herd tests/plan.sh
+	bash tests/plan.sh
 
 # Copy into $(PREFIX) (default ~/.local). PKGBUILD uses this with PREFIX=/usr.
 install:

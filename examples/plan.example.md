@@ -11,6 +11,11 @@
 # the last stage only, push and open the PR. A stage's first "verify:" line is the command herd
 # runs before moving on (-v gives a default for stages without one). Everything above the first
 # heading, like this comment, is kept in .herd/run/plan.md for the agents' context only.
+#
+# herd gates a stage only once its turn has ended and the agent has no background shell or
+# Monitor still running (it waits up to -W minutes, default 60). A stage that may need to stop
+# the whole run says so in its prompt: herd stops at once, with no fix-up turn, when PROGRESS.md
+# has a line starting "STOPPED:", as stage 1 does below.
 
 ## Stage 1: Export model
 verify: make test
@@ -18,6 +23,8 @@ verify: make test
 Add a `to_csv_rows()` function next to the existing `to_json()` in src/report.py, returning a
 header row and one row per entry, using the same field order as `to_json()`. Add unit tests for an
 empty report and a report with a comma inside a field.
+If src/report.py has no `to_json()`, this plan is out of date: write
+`STOPPED: no to_json() in src/report.py` to .herd/run/PROGRESS.md and end your turn.
 
 ## Stage 2: CLI flag
 verify: make test
