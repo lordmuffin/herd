@@ -292,6 +292,27 @@ pick_parent() {
   fi
 }
 
+# A worktree already at $wt_path, left by an earlier start that never got going, is reused when
+# there is nothing in it to lose. Anything else is named, with how to remove it, and left alone.
+reusable_wt() {
+  local branch=$1 why="" cur common
+  common=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)
+  if [[ $(git -C "$wt_path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) != "$common" ]]; then
+    why="it is not a worktree of $repo"
+  elif cur=$(git -C "$wt_path" rev-parse --abbrev-ref HEAD) && [[ $cur != "$branch" ]]; then
+    why="it is on $cur, not $branch"
+  elif [[ -n $(git -C "$wt_path" status --porcelain) ]]; then
+    why="it has uncommitted changes"
+  elif [[ -n $(git -C "$wt_path" rev-list "$base..HEAD") ]]; then
+    why="it has commits not in $base"
+  elif h agent list | jq -e --arg p "$wt_path" 'any(.result.agents[]; .cwd == $p)' >/dev/null; then
+    why="an agent is already running in it"
+  fi
+  [[ -z $why ]] && return 0
+  die "$wt_path already exists and $why, so herd won't reuse it. Check it, then remove it with:" \
+    "herd rm $branch (or: git -C $repo worktree remove $wt_path)"
+}
+
 # Creates the branch's worktree and workspace and starts an agent in it, without a prompt.
 # Sets wt_name, wt_path and wt_pane.
 create_agent() {
@@ -303,8 +324,14 @@ create_agent() {
 
   local src=(--cwd "$repo")
   [[ -n $parent_ws ]] && src=(--workspace "$parent_ws")
-  out=$(h worktree create "${src[@]}" --branch "$branch" --base "$base" \
-          --path "$wt_path" --label "$wt_name" --no-focus) || die "worktree create failed for $branch"
+  if [[ -z $machine && -e $wt_path ]] && reusable_wt "$branch"; then
+    out=$(h worktree open "${src[@]}" --path "$wt_path" --label "$wt_name" --no-focus) \
+      || die "worktree open failed for $wt_path"
+    echo "herd: reusing $wt_path (clean, on $branch, nothing beyond $base, no agent)" >&2
+  else
+    out=$(h worktree create "${src[@]}" --branch "$branch" --base "$base" \
+            --path "$wt_path" --label "$wt_name" --no-focus) || die "worktree create failed for $branch"
+  fi
   wt_pane=$(jq -r '.result.root_pane.pane_id' <<<"$out")
 
   h agent start "$wt_name" --kind "$kind" --pane "$wt_pane" --timeout 90000 -- "${agent_args[@]}" >/dev/null \
