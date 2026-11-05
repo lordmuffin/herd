@@ -48,6 +48,7 @@ herd plan feat/export-csv PLAN.md          # a file
 herd plan -v "make test" feat/x - <PLAN.md # stdin, with a default verify command
 herd plan -n feat/x PLAN.md                # stop once the stages are written, to review them
 herd plan -R feat/x                        # resume after a block, a failed gate, or ^C
+herd plan -W 120 feat/lab PLAN.md          # wait up to 2 h for a stage's background jobs
 ```
 
 1. **Planning.** A `planner` turn reads the plan and the code and writes
@@ -62,9 +63,25 @@ herd plan -R feat/x                        # resume after a block, a failed gate
    and the stage's `verify:` command (or `-v`) passes. If the gate fails, herd sends one
    fix-up turn with the failures. If it fails a second time, herd stops. The last stage must
    also push and open the PR, and with a forgejo-cli login herd checks that the PR exists.
+   An idle agent that is still waiting on work it started is not done: before gating, herd
+   reads the pane, and while claude's footer shows background work (`1 shell, 1 monitor still
+   running`, or `· 2 shells ·` in its status line) herd re-checks every 30 s instead of gating
+   (`HERD_BG_POLL` sets the interval). When the job finishes, the agent wakes, finishes the
+   stage, and herd gates that turn. A fix-up turn that ends on background work is waited out
+   the same way, so it doesn't count as the second failure. Every stage prompt also tells the
+   agent never to end a turn while a job, Monitor or eval it started is still running, which
+   covers agents whose footer herd can't parse.
 4. **Stops.** A blocked agent, or a stage that fails twice, stops the run with the reason;
    fix it in the pane (or edit `stages.md`), then `herd plan -R <branch>`. The step state is in
-   `.herd/run/state`, so `-R` re-checks the stage where it stopped and carries on.
+   `.herd/run/state`, so `-R` re-checks the stage where it stopped and carries on. Two more
+   stops don't count as a failed gate:
+   - **Background work past the cap.** herd waits at most 60 minutes for it (`-W <min>` to
+     change, also on `-R`), then stops with that reason.
+   - **`STOPPED:`.** A line starting `STOPPED:` in `.herd/run/PROGRESS.md` stops the run as
+     soon as the turn ends, with that line as the reason and no fix-up turn. Use it for a
+     plan's own stop rules ("if the lab host is unreachable, write `STOPPED: <why>`") instead of
+     adding `! grep -q '^STOPPED' .herd/run/PROGRESS.md` to every `verify:`. Delete the line
+     before `-R`.
 
 `.herd/run/` is added to the repo's `info/exclude`, so the plan, stages and handoff notes never
 land in the PR. `herd done <branch>` cleans up as usual once it merges. `verify:` commands run
@@ -199,4 +216,5 @@ doubled name is the `directories` crate's macOS layout), which `herd` checks aft
 
 ## Develop
 
-`make test` runs `bash -n` and `shellcheck -S warning`, the same checks `makepkg` runs.
+`make test` runs `bash -n`, `shellcheck -S warning` and `tests/plan.sh` (the `herd plan` stage
+loop against a faked herdr), the same checks `makepkg` runs.

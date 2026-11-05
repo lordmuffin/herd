@@ -1,0 +1,9 @@
+● The lab driver finished: 12/12 checks passed. Committed and appended "## Stage 1" to
+  .herd/run/PROGRESS.md.
+
+✻ Crunched for 7m 2s · done 6:32 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

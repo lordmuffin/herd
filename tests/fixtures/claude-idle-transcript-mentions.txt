@@ -1,0 +1,22 @@
+● Earlier I had 2 shells and 1 monitor still running · all of them are done now.
+  line 1 of the summary
+  line 2 of the summary
+  line 3 of the summary
+  line 4 of the summary
+  line 5 of the summary
+  line 6 of the summary
+  line 7 of the summary
+  line 8 of the summary
+  line 9 of the summary
+  line 10 of the summary
+  line 11 of the summary
+  line 12 of the summary
+● The lab driver finished: 12/12 checks passed. Committed and appended "## Stage 1" to
+  .herd/run/PROGRESS.md.
+
+✻ Crunched for 7m 2s · done 6:32 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

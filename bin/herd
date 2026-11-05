@@ -4,7 +4,7 @@
 #   herd [opts] <branch> <prompt> [<branch> <prompt> ...]
 #   herd [opts] [-f Tasks.herd]       # one "branch: prompt" per line, # comments ok; with no
 #                                     # tasks given, reads Tasks.herd from the repo root
-#   herd plan [opts] [-v cmd] <branch> <plan.md|-|text>
+#   herd plan [opts] [-v cmd] [-W min] <branch> <plan.md|-|text>
 #                                     # run one complete plan as a chain of stages in one worktree:
 #                                     # a planner turn splits it into .herd/run/stages.md (skipped
 #                                     # if the plan already has "## Stage N: title" headings), then
@@ -13,7 +13,10 @@
 #                                     # tree committed, its "verify:" command or -v passing) before
 #                                     # the next starts; one fix-up turn on a miss. The last stage
 #                                     # pushes and opens the PR. -P sets the stage persona (default
-#                                     # engineer); -n stops once the stages are written
+#                                     # engineer); -n stops once the stages are written. A turn that
+#                                     # ends with background shells or monitors still running is
+#                                     # waited out before the gate, up to -W minutes (default 60).
+#                                     # A "STOPPED: reason" line in PROGRESS.md stops the run at once
 #   herd plan -R <branch>             # resume a plan stopped by a block, a failed gate or ^C
 #   herd ls                           # agents + their status
 #   herd personas [<name>]            # list personas, or print one as a ready-to-paste prompt
@@ -46,7 +49,7 @@
 set -euo pipefail
 
 repo="" base="origin/main" kind="claude" machine="" parent="" parent_ws="" wait=0 force=0 file="" agent_args=() targets=()
-persona="" dry=0
+persona="" dry=0 bg_wait=60 bg_poll=${HERD_BG_POLL:-30}
 
 die() { echo "herd: $*" >&2; exit 1; }
 h() { if [[ -n $machine ]]; then herdr --machine "$machine" "$@"; else herdr "$@"; fi; }
@@ -289,6 +292,27 @@ pick_parent() {
   fi
 }
 
+# A worktree already at $wt_path, left by an earlier start that never got going, is reused when
+# there is nothing in it to lose. Anything else is named, with how to remove it, and left alone.
+reusable_wt() {
+  local branch=$1 why="" cur common
+  common=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)
+  if [[ $(git -C "$wt_path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) != "$common" ]]; then
+    why="it is not a worktree of $repo"
+  elif cur=$(git -C "$wt_path" rev-parse --abbrev-ref HEAD) && [[ $cur != "$branch" ]]; then
+    why="it is on $cur, not $branch"
+  elif [[ -n $(git -C "$wt_path" status --porcelain) ]]; then
+    why="it has uncommitted changes"
+  elif [[ -n $(git -C "$wt_path" rev-list "$base..HEAD") ]]; then
+    why="it has commits not in $base"
+  elif h agent list | jq -e --arg p "$wt_path" 'any(.result.agents[]; .cwd == $p)' >/dev/null; then
+    why="an agent is already running in it"
+  fi
+  [[ -z $why ]] && return 0
+  die "$wt_path already exists and $why, so herd won't reuse it. Check it, then remove it with:" \
+    "herd rm $branch (or: git -C $repo worktree remove $wt_path)"
+}
+
 # Creates the branch's worktree and workspace and starts an agent in it, without a prompt.
 # Sets wt_name, wt_path and wt_pane.
 create_agent() {
@@ -300,8 +324,14 @@ create_agent() {
 
   local src=(--cwd "$repo")
   [[ -n $parent_ws ]] && src=(--workspace "$parent_ws")
-  out=$(h worktree create "${src[@]}" --branch "$branch" --base "$base" \
-          --path "$wt_path" --label "$wt_name" --no-focus) || die "worktree create failed for $branch"
+  if [[ -z $machine && -e $wt_path ]] && reusable_wt "$branch"; then
+    out=$(h worktree open "${src[@]}" --path "$wt_path" --label "$wt_name" --no-focus) \
+      || die "worktree open failed for $wt_path"
+    echo "herd: reusing $wt_path (clean, on $branch, nothing beyond $base, no agent)" >&2
+  else
+    out=$(h worktree create "${src[@]}" --branch "$branch" --base "$base" \
+            --path "$wt_path" --label "$wt_name" --no-focus) || die "worktree create failed for $branch"
+  fi
   wt_pane=$(jq -r '.result.root_pane.pane_id' <<<"$out")
 
   h agent start "$wt_name" --kind "$kind" --pane "$wt_pane" --timeout 90000 -- "${agent_args[@]}" >/dev/null \
@@ -354,7 +384,7 @@ stage_table() {
 
 save_state() {
   printf '%s=%s\n' stage "$stage" status "$status" persona "$persona" kind "$kind" \
-    verify "$plan_verify" base "$base" >"$run/state"
+    verify "$plan_verify" base "$base" bgwait "$bg_wait" >"$run/state"
 }
 
 load_state() {
@@ -362,7 +392,7 @@ load_state() {
   while IFS='=' read -r k v; do
     case $k in
       stage) stage=$v ;; status) status=$v ;; persona) persona=$v ;; kind) kind=$v ;;
-      verify) plan_verify=$v ;; base) base=$v ;;
+      verify) plan_verify=$v ;; base) base=$v ;; bgwait) bg_wait=$v ;;
     esac
   done <"$run/state"
 }
@@ -386,6 +416,57 @@ await_agent() {
       "— answer it in its pane, then: herd plan -R $plan_branch" >&2
     return 1
   fi
+}
+
+# True if pane text on stdin shows background work still running. Only the last non-blank lines
+# count, so the transcript above the prompt box can't match. claude's footer says "1 shell,
+# 1 monitor still running" and its status line "· 1 shell, 1 monitor ·"; the "background
+# terminal/task/job" forms are a guess at codex, whose footer is not verified.
+bg_text_busy() {
+  local footer
+  footer=$(grep -v '^[[:space:]]*$' | tail -n 10) || true
+  grep -Eiq '(^|[^[:alnum:]])[0-9]+ (shells?|monitors?|background (terminals?|tasks?|jobs?))([^[:alnum:]]|$)|·.*still running' \
+    <<<"$footer"
+}
+
+# True if the agent's pane shows background work running. An unreadable pane counts as not busy;
+# the turn rule in the stage prompt still tells the agent not to end a turn on running work.
+bg_busy() {
+  local txt
+  txt=$(h agent read "$wt_name" --source visible 2>/dev/null) || return 1
+  bg_text_busy <<<"$txt"
+}
+
+# A plan's own stop rule: a line starting "STOPPED:" in PROGRESS.md ends the run at once, with no
+# fix-up turn. State keeps its status, so -R re-checks the same stage once the line is gone.
+check_stopped() {
+  local line
+  line=$(grep -m1 '^STOPPED:' "$run/PROGRESS.md" 2>/dev/null) || return 0
+  save_state
+  echo "herd: stage $stage stopped the run — $line" >&2
+  echo "herd: deal with it, delete that line from $run/PROGRESS.md, then: herd plan -R $plan_branch" >&2
+  exit 1
+}
+
+# Waits for a stage's turn to end, then for any background work the agent is still waiting on (a
+# shell or a Monitor it started), so the gate never checks work that is still in flight. When
+# that work finishes, the agent wakes, takes another turn, and this waits for that one too. Gives
+# up after $bg_wait minutes; that stops the run but is not a failed gate.
+await_stage() {
+  local start=$SECONDS said=0
+  while :; do
+    await_agent || exit 3
+    check_stopped
+    bg_busy || return 0
+    if ((SECONDS - start >= bg_wait * 60)); then
+      save_state
+      echo "herd: stage $stage still has background work running after $bg_wait min — check its pane," \
+        "then: herd plan -R $plan_branch (-W sets the wait)" >&2
+      exit 3
+    fi
+    ((said++)) || echo "  stage $stage: turn ended with background work still running, waiting for it"
+    sleep "$bg_poll"
+  done
 }
 
 # Clears the agent's conversation so each stage starts from PROGRESS.md, not a growing context.
@@ -440,6 +521,11 @@ When you are done:
 4. $(if ((last)); then echo "This is the final stage: push the branch and open a PR into ${base#origin/}, with a body that summarises every stage from PROGRESS.md."; else echo "Do not push or open a PR; the final stage does that. Then stop."; fi)
 
 herd checks all of this before it starts the next stage.
+
+herd checks the stage when your turn ends. Never end a turn while a job, Monitor or eval you
+started is still running: wait for it in the same turn, then commit and append the
+"## Stage $stage" section to .herd/run/PROGRESS.md. If this stage tells you to stop the run, add a
+line starting "STOPPED:" with the reason to .herd/run/PROGRESS.md and end your turn.
 
 ## Stage $stage: $title
 
@@ -509,11 +595,14 @@ drive_plan() {
         send_prompt "$wt_name" "$(compose "$persona" "$(stage_prompt "$v" "$last")")"
         echo "stage $stage/$total: $(stage_field "$run/stages.md" "$stage" title)" ;;
     esac
-    # running, fixing, blocked or failed: let the turn end, then check the work.
-    await_agent || exit 3
+    # running, fixing, blocked or failed: let the turn and its background work end, then check.
+    await_stage
     if stage_gate "$v" "$last"; then
       status=verified; save_state; echo "  stage $stage verified"; continue
     fi
+    # The gate can take a while. If the agent started more background work meanwhile, wait again
+    # rather than send (or count) a fix-up turn against work still in flight.
+    if bg_busy; then continue; fi
     if [[ $status == fixing ]]; then
       status=failed; save_state
       echo "herd: stage $stage still fails after a fix-up turn:" >&2; sed 's/^/    /' <<<"$gate_msg" >&2
@@ -522,7 +611,7 @@ drive_plan() {
     fi
     echo "  stage $stage not done yet, sending a fix-up turn:"; sed 's/^/    /' <<<"$gate_msg"
     status=fixing; save_state
-    send_prompt "$wt_name" "Stage $stage of $total is not done yet. herd checked and found:"$'\n\n'"$gate_msg"$'\n'"Fix these, then make sure the \"## Stage $stage\" section of .herd/run/PROGRESS.md is up to date, and stop."
+    send_prompt "$wt_name" "Stage $stage of $total is not done yet. herd checked and found:"$'\n\n'"$gate_msg"$'\n'"Fix these, then make sure the \"## Stage $stage\" section of .herd/run/PROGRESS.md is up to date, and stop. Don't end the turn while a job, Monitor or eval you started is still running."
   done
   status=complete; save_state
   echo "plan complete: $total stage(s) on $plan_branch. After the PR merges: herd done $plan_branch"
@@ -538,6 +627,7 @@ cmd_plan() {
     wt_name=$(agent_name "$plan_branch") wt_path=$path run="$path/.herd/run"
     [[ -f $run/state ]] || die "no plan run in $path"
     load_state
+    bg_wait=${bg_wait_opt:-$bg_wait}   # -W on a resume overrides the saved wait
     [[ $status != complete ]] || { echo "plan on $plan_branch is already complete"; return; }
     echo "resuming $plan_branch at stage $stage ($status)"
     drive_plan; return
@@ -581,6 +671,9 @@ cmd_plan() {
   drive_plan
 }
 
+# Sourced (by tests/plan.sh): define the functions above, run nothing.
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
+
 case ${1:-} in
   ls) shift; cmd_ls; exit ;;
   personas) shift; [[ $# -le 1 ]] || die "personas takes at most one name"
@@ -589,10 +682,13 @@ case ${1:-} in
       shift $((OPTIND-1)); targets=("$@"); [[ -n $file || $# -gt 0 ]] || file=$(default_file)
       [[ -z $file ]] || read_targets "$file"
       [[ ${#targets[@]} -gt 0 ]] || die "done needs a branch or agent name (or -f file, or a Tasks.herd)"; cmd_done "${targets[@]}"; exit ;;
-  plan) shift; resume=0 plan_verify=""
-      while getopts "r:b:k:m:p:P:v:nRh" o; do case $o in
+  plan) shift; resume=0 plan_verify="" bg_wait_opt=""
+      while getopts "r:b:k:m:p:P:v:W:nRh" o; do case $o in
         r) repo=$OPTARG;; b) base=$OPTARG;; k) kind=$OPTARG;; m) machine=$OPTARG;; p) parent=$OPTARG;;
-        P) persona=$OPTARG;; v) plan_verify=$OPTARG;; n) dry=1;; R) resume=1;; h) usage; exit;; *) exit 2;; esac; done
+        P) persona=$OPTARG;; v) plan_verify=$OPTARG;; W) bg_wait_opt=$OPTARG;; n) dry=1;; R) resume=1;;
+        h) usage; exit;; *) exit 2;; esac; done
+      [[ -z $bg_wait_opt || $bg_wait_opt =~ ^[0-9]+$ ]] || die "-W takes whole minutes, not '$bg_wait_opt'"
+      bg_wait=${bg_wait_opt:-$bg_wait}
       shift $((OPTIND-1)); plan_branch=$(tr -d '[:space:]' <<<"${1:-}")
       [[ -n $plan_branch ]] || die "plan needs a branch: herd plan <branch> <plan.md|-|text>, or herd plan -R <branch>"
       shift
