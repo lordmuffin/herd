@@ -215,17 +215,47 @@ forgejo_keys() {
   die "no forgejo-cli keys.json (run: fj auth login, or fj auth add-token)"
 }
 
+have() { command -v "$1" >/dev/null; }
+
+origin_url() { git -C "$repo" remote get-url origin; }
+url_host() { sed -E 's#^[a-z+]+://([^@/]+@)?([^:/]+).*#\2#; s#^[^@]+@([^:]+):.*#\1#' <<<"$1"; }
+url_slug() { sed -E 's#\.git$##; s#.*[:/]([^/]+/[^/]+)$#\1#' <<<"$1"; }
+
 # Forgejo API call authenticated with fj's stored token for the origin host.
 forgejo() {
   local url host keys tok
   keys=$(forgejo_keys)
-  url=$(git -C "$repo" remote get-url origin)
-  host=$(sed -E 's#^[a-z+]+://([^@/]+@)?([^:/]+).*#\2#; s#^[^@]+@([^:]+):.*#\1#' <<<"$url")
-  host=$(jq -r --arg h "$host" '.aliases[$h] // $h' "$keys")
+  url=$(origin_url)
+  host=$(jq -r --arg h "$(url_host "$url")" '.aliases[$h] // $h' "$keys")
   tok=$(jq -r --arg h "$host" '.hosts[$h].token // empty' "$keys")
   [[ -n $tok ]] || die "no fj token for $host (run: fj auth login, or fj auth add-token)"
-  repo_slug=$(sed -E 's#\.git$##; s#.*[:/]([^/]+/[^/]+)$#\1#' <<<"$url")
-  curl -sf -H "Authorization: token $tok" "https://$host/api/v1/repos/$repo_slug/$1"
+  curl -sf -H "Authorization: token $tok" "https://$host/api/v1/repos/$(url_slug "$url")/$1"
+}
+
+# The PR from branch $2 into $1, as {number, state, merged, html_url}, from whichever forge
+# hosts origin: gh for github.com, the Forgejo API (fj's token) for any other host.
+# Exit 0 found, 1 no such PR, 2 can't check here (no login, no gh, the call failed); the
+# reason for 2 goes to stderr.
+pr_lookup() {
+  local into=$1 branch=$2 url host out
+  url=$(origin_url) || { echo "herd: no origin remote" >&2; return 2; }
+  host=$(url_host "$url")
+  if [[ $host == github.com ]]; then
+    have gh || { echo "herd: origin is on github.com and gh is not installed" >&2; return 2; }
+    out=$(gh pr list --repo "$(url_slug "$url")" --head "$branch" --base "$into" --state all \
+            --json number,state,url --limit 1) \
+      || { echo "herd: gh could not list PRs for $(url_slug "$url")" >&2; return 2; }
+    [[ $(jq length <<<"$out") -gt 0 ]] || return 1
+    jq -c '.[0] | {number, state: (.state | ascii_downcase | if . == "merged" then "closed" else . end),
+                   merged: (.state == "MERGED"), html_url: .url}' <<<"$out"
+    return 0
+  fi
+  (forgejo_keys >/dev/null 2>&1) || { echo "herd: no forgejo-cli login to check PRs on $host" >&2; return 2; }
+  out=$( (forgejo "pulls/$into/$branch") 2>&1 )
+  case $? in
+    0) printf '%s\n' "$out" ;;
+    *) if [[ $out == *"no fj token"* ]]; then echo "$out" >&2; return 2; fi; return 1 ;;
+  esac
 }
 
 # Clean up a stream only once its PR is merged: agent idle, worktree clean, then worktree,
@@ -235,9 +265,11 @@ cmd_done() {
   local into=${base#origin/} pr status dirty
   for target in "$@"; do
     find_wt "$target" || continue
-    if ! pr=$(forgejo "pulls/$into/$branch"); then
-      echo "herd: $branch has no PR into $into — not removing (use herd rm to discard)" >&2; continue
-    fi
+    pr=$(pr_lookup "$into" "$branch"); case $? in
+      0) ;;
+      1) echo "herd: $branch has no PR into $into — not removing (use herd rm to discard)" >&2; continue ;;
+      *) echo "herd: can't check $branch's PR — not removing (use herd rm to discard)" >&2; continue ;;
+    esac
     if [[ $(jq -r .merged <<<"$pr") != true ]]; then
       echo "herd: $branch PR #$(jq -r .number <<<"$pr") is $(jq -r .state <<<"$pr"), not merged — skipping" >&2
       ((force)) || continue
@@ -533,6 +565,17 @@ $body
 EOF
 }
 
+# The last stage's PR check, as a gate line (empty when the PR exists). Where herd can't check
+# (no gh, no fj login, the call failed) it is skipped with a note on stderr, not failed.
+stage_pr_msg() {
+  local into=${base#origin/} err rc
+  err=$(pr_lookup "$into" "$plan_branch" 2>&1 >/dev/null); rc=$?
+  case $rc in
+    1) printf -- '- There is no PR from %s into %s.' "$plan_branch" "$into" ;;
+    2) echo "  could not check the PR, so not gating on it: $err" >&2 ;;
+  esac
+}
+
 # Checks that stage $stage is really finished. Sets gate_msg to what is missing.
 stage_gate() {
   local v=$1 last=$2 out dirty head remote
@@ -550,10 +593,7 @@ stage_gate() {
     head=$(git -C "$wt_path" rev-parse HEAD)
     remote=$(git -C "$wt_path" ls-remote origin "refs/heads/$plan_branch" | cut -f1)
     [[ $head == "$remote" ]] || gate_msg+="- The branch is not pushed to origin at HEAD."$'\n'
-    # Only checked where herd done could check it too, i.e. with a forgejo-cli login.
-    if (forgejo_keys >/dev/null 2>&1) && ! (forgejo "pulls/${base#origin/}/$plan_branch" >/dev/null 2>&1); then
-      gate_msg+="- There is no PR from $plan_branch into ${base#origin/}."$'\n'
-    fi
+    out=$(stage_pr_msg); [[ -z $out ]] || gate_msg+="$out"$'\n'
   fi
   [[ -z $gate_msg ]]
 }

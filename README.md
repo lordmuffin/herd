@@ -62,7 +62,8 @@ herd plan -W 120 feat/lab PLAN.md          # wait up to 2 h for a stage's backgr
 3. **Gate.** When the turn ends, herd checks the handoff section exists, the tree is clean,
    and the stage's `verify:` command (or `-v`) passes. If the gate fails, herd sends one
    fix-up turn with the failures. If it fails a second time, herd stops. The last stage must
-   also push and open the PR, and with a forgejo-cli login herd checks that the PR exists.
+   also push and open the PR, and herd checks that the PR exists: with `gh` for a github.com origin,
+   with a forgejo-cli login for any other host. Where it can't check, it says so and skips that check.
    An idle agent that is still waiting on work it started is not done: before gating, herd
    reads the pane, and while claude's footer shows background work (`1 shell, 1 monitor still
    running`, or `· 2 shells ·` in its status line) herd re-checks every 30 s instead of gating
@@ -174,7 +175,8 @@ It then removes the worktree, closes the workspace, and deletes the local and re
 - [herdr](https://herdr.dev), run from inside a Herdr pane;
 - `bash`, `git`, `jq` and `curl`;
 - `column` (from util-linux);
-- for `herd done`, a Forgejo login via [forgejo-cli](https://codeberg.org/forgejo-contrib/forgejo-cli).
+- for `herd done` and the PR check in `herd plan`: `gh` (logged in) for repos on github.com, and for
+  any other host a Forgejo login via [forgejo-cli](https://codeberg.org/forgejo-contrib/forgejo-cli).
   `fj auth login` needs an OAuth app registered on the instance; where there isn't one, create a
   token at `/user/settings/applications` (`read:repository` covers `herd done`; `write:repository`
   if the agents open their PRs with `fj` too) and add it with
