@@ -896,6 +896,9 @@ while getopts "r:b:k:m:p:P:f:wnh" o; do
     h) usage; exit ;; *) exit 2 ;;
   esac
 done
+# getopts eats a bare -- as its end-of-options marker. Put it back, so `herd [opts] -- <args>`
+# passes <args> to the agent instead of reading them as <branch> <prompt> pairs.
+((OPTIND > 1)) && [[ ${*:OPTIND-1:1} == "--" ]] && OPTIND=$((OPTIND - 1))
 shift $((OPTIND-1))
 
 tasks=()
