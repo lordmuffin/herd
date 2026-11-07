@@ -816,6 +816,9 @@ cmd_draft() {
   local text tmp sid turns=0
   if [[ $draft_src == - ]]; then text=$(cat)
   elif [[ -f $draft_src ]]; then text=$(cat "$draft_src")
+  # A missing file must not become the goal: "/path/to/PLAN.md" would be drafted as a task.
+  elif [[ $draft_src != *$'\n'* ]] && [[ $draft_src =~ ^(/|\./|\.\./|~/) || $draft_src =~ ^[^[:space:]]+\.(md|txt)$ ]]; then
+    die "no such file: $draft_src (to use that text as the goal, pass it on stdin with -)"
   else text=$draft_src; fi
   [[ -n ${text//[[:space:]]/} ]] || die "the goal is empty"
   out=${out:-$repo/Tasks.herd}
