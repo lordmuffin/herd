@@ -7,6 +7,7 @@ then clean them up once their PRs merge.
 herd -P engineer fix/foo "Fix X. Label the PR review-me."   # one task, with a persona
 herd                                                       # a batch from Tasks.herd in the repo root
 herd -f other.herd                                         # a batch from any other file
+herd draft "Add CSV export and document it"                # write Tasks.herd from a goal
 herd -n                                                    # dry run: what would start, and as what
 herd ls                                                    # agents and their status
 herd done fix/foo                                          # after merge: remove worktree + branches
@@ -27,6 +28,34 @@ line. With no tasks on the command line, `herd` and `herd done` read it and prin
 `-f` or explicit branches take precedence, and with no `Tasks.herd` `herd` prints its usage.
 `herd rm` never picks it up on its own, because it deletes without checks: name the file
 with `-f`.
+
+## Drafting a task file
+
+`herd draft` turns a goal into a task file, so you don't have to split the work and write the
+prompts yourself:
+
+```bash
+herd draft "Add CSV export to reports, and document it"   # writes Tasks.herd in the repo root
+herd draft -o Tasks-export.herd GOAL.md                    # a file as the goal, another output
+herd draft -o - - <GOAL.md                                 # stdin in, stdout out
+herd draft "..." -- --model opus                           # extra args for claude
+```
+
+A `dispatcher` agent runs headless in the repo root with only `Read`, `Grep` and `Glob`, so it
+can read the code but change nothing. It splits the goal into independent tasks, which will run
+in parallel from the same base, and writes one `branch @persona: prompt` line for each, with
+a comment above it. It picks a persona from the ones `herd personas` lists.
+
+Before saving, herd checks every line the way a run would: the line format, a persona on each
+line that resolves, a valid branch that doesn't already exist, and no two tasks with the same
+agent name. On a miss, herd sends the dispatcher one fix-up turn in the same session. A second
+miss stops the run and leaves the draft in a temp file. The saved file starts with the goal as a
+comment, and herd prints its `herd -n` dry run. Read it, edit it if you like, then start it
+with `herd`.
+
+An existing output file is refused unless you pass `-F`. Work that has to happen in order is
+one task (the dispatcher says so in a comment), and is better run with `herd plan`. `draft`
+needs the `claude` CLI and runs on this machine only.
 
 ## What it does
 
@@ -119,7 +148,7 @@ herd personas              # name, one-line summary, and which file won
 herd personas engineer     # print the composed prompt (pipe it into any agent, herd or not)
 ```
 
-Six ship with `herd`, each self-contained and agent-agnostic:
+Seven ship with `herd`, each self-contained and agent-agnostic:
 
 | persona | leaves behind | touches code |
 | --- | --- | --- |
@@ -129,6 +158,7 @@ Six ship with `herd`, each self-contained and agent-agnostic:
 | `reviewer` | `REVIEW.md`, findings ranked by consequence | no |
 | `writer` | docs edits and a PR | docs only |
 | `planner` | `.herd/run/stages.md` for `herd plan` | no |
+| `dispatcher` | a task file, for `herd draft` | no |
 
 In a task file, `@persona` on a line overrides `-P`, and `@none` runs the prompt bare:
 

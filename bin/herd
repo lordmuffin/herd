@@ -18,6 +18,11 @@
 #                                     # waited out before the gate, up to -W minutes (default 60).
 #                                     # A "STOPPED: reason" line in PROGRESS.md stops the run at once
 #   herd plan -R <branch>             # resume a plan stopped by a block, a failed gate or ^C
+#   herd draft [-o file] [-F] <goal|file|->
+#                                     # turn a goal into a task file: a read-only dispatcher agent
+#                                     # reads the repo and writes one "branch @persona: prompt" line
+#                                     # per parallel task; herd checks every line before it saves
+#                                     # Tasks.herd (or -o file, "-" for stdout; -F overwrites)
 #   herd ls                           # agents + their status
 #   herd personas [<name>]            # list personas, or print one as a ready-to-paste prompt
 #   herd rm [-f file] <branch|name>...        # remove worktree, workspace and local branch
@@ -714,6 +719,136 @@ cmd_plan() {
 # Sourced (by tests/plan.sh): define the functions above, run nothing.
 [[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
 
+# --- herd draft: a goal in, a task file out ----------------------------------------------------
+# A dispatcher agent reads the repo (read-only tools, headless, in the repo root) and writes the
+# task file; herd checks every line the way a run would before it saves anything.
+
+# Personas a task line can name, as "- name: summary". Leaves out the ones herd runs itself, and
+# names a "@persona" can't spell.
+task_personas() {
+  local d f
+  while IFS= read -r d; do
+    [[ -d $d ]] || continue
+    for f in "$d"/*.md; do
+      [[ -f $f ]] || continue
+      printf '%s\t%s\n' "$(basename "$f" .md)" "$(sed -n 's/^> //p' "$f" | head -1)"
+    done
+  done < <(persona_dirs) | awk -F'\t' '
+    !seen[$1]++ && $1 ~ /^[A-Za-z0-9._-]+$/ && $1 != "planner" && $1 != "dispatcher" {
+      d = $2 == "" ? "(no summary)" : $2; if (length(d) > 140) d = substr(d, 1, 137) "..."
+      print "  - " $1 ": " d }'
+}
+
+draft_prompt() {
+  cat <<EOF
+Turn the goal below into a herd task file for this repository. Read the code the goal touches
+first, then write the file.
+
+Each task line starts one agent, in its own fresh worktree cut from $base, all at the same time:
+
+<branch> @<persona>: <prompt>
+
+- <branch> is a new git branch with a type prefix (fix/, feat/, docs/, chore/, ...), short and
+  unique; it also names the agent, cut to 32 characters.
+- @<persona> is one of:
+$(task_personas)
+- <prompt> is the whole task on ONE line, however long. Only the first ":" splits the line, so
+  the prompt may contain colons.
+- Put a "# " comment line above each task saying what it is for. If the goal is one change whose
+  parts must happen in order, write a single task and say in its comment that "herd plan" fits
+  it better.
+
+Reply with the file's contents only: no code fences, no preamble, nothing after the last task.
+Change no files.
+
+# Goal
+
+$1
+EOF
+}
+
+# Checks task file $1 the way a run would, plus what a run would trip over later: a bad branch
+# name, one that already exists, or two tasks with the same agent name. Every line must name its
+# persona, which also keeps a stray "Sure: here it is" from passing as a task. Sets gate_msg.
+check_task_file() {
+  local line key prompt n=0 seen=" " an
+  gate_msg=""
+  while IFS= read -r line; do
+    [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+    key=${line%%:*}
+    if [[ $line != *:* || ! $key =~ ^[[:space:]]*[^[:space:]@]+[[:space:]]+@[A-Za-z0-9._/-]+[[:space:]]*$ ]]; then
+      gate_msg+="- not a \"<branch> @<persona>: <prompt>\" line: ${line:0:100}"$'\n'; continue
+    fi
+    n=$((n + 1))
+    split_key "$key"
+    prompt=$(sed 's/^[[:space:]]*//' <<<"${line#*:}")
+    [[ -n $prompt ]] || gate_msg+="- $task_branch has an empty prompt"$'\n'
+    git check-ref-format --branch "$task_branch" >/dev/null 2>&1 \
+      || gate_msg+="- $task_branch is not a valid branch name"$'\n'
+    if git -C "$repo" show-ref --quiet --verify "refs/heads/$task_branch" \
+        || git -C "$repo" show-ref --quiet --verify "refs/remotes/origin/$task_branch"; then
+      gate_msg+="- branch $task_branch already exists, pick another name"$'\n'
+    fi
+    an=$(agent_name "$task_branch")
+    [[ $seen != *" $an "* ]] || gate_msg+="- $task_branch gives agent name $an, which another task already has"$'\n'
+    seen+="$an "
+    if [[ -n $task_persona && $task_persona != none ]] && ! (persona_file "$task_persona" >/dev/null 2>&1); then
+      gate_msg+="- $task_branch names an unknown persona @$task_persona"$'\n'
+    fi
+  done <"$1"
+  ((n)) || gate_msg+="- there are no task lines"$'\n'
+  [[ -z $gate_msg ]]
+}
+
+# One headless dispatcher turn; the first starts session $sid, later ones resume it.
+draft_turn() {
+  local args=(-p "--tools=Read,Grep,Glob" --output-format text)
+  if ((turns++)); then args+=(--resume "$sid"); else args+=(--session-id "$sid"); fi
+  (cd "$repo" && claude "${args[@]}" "${agent_args[@]}" <<<"$1") | sed '/^[[:space:]]*```/d'
+}
+
+cmd_draft() {
+  [[ -z $machine ]] || die "draft runs on this machine only (no -m)"
+  [[ $kind == claude ]] || die "draft runs claude headless; -k $kind is not supported"
+  command -v claude >/dev/null || die "draft needs the claude CLI on PATH"
+  [[ -n $repo ]] || repo=$(git rev-parse --show-toplevel)
+  repo=$(cd "$repo" && git rev-parse --show-toplevel)
+  local text tmp sid turns=0
+  if [[ $draft_src == - ]]; then text=$(cat)
+  elif [[ -f $draft_src ]]; then text=$(cat "$draft_src")
+  else text=$draft_src; fi
+  [[ -n ${text//[[:space:]]/} ]] || die "the goal is empty"
+  out=${out:-$repo/Tasks.herd}
+  if [[ $out != - && -e $out ]] && ! ((force)); then
+    if [[ $out == "$repo/Tasks.herd" ]]; then
+      die "$out already exists: name another with -o Tasks-<name>.herd, or -F to overwrite it"
+    fi
+    die "$out already exists (-F overwrites it)"
+  fi
+  persona_file dispatcher >/dev/null
+
+  sid=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid) || die "could not make a session id"
+  tmp=$(mktemp "${TMPDIR:-/tmp}/herd-draft.XXXXXX")
+  echo "herd: drafting tasks in $repo (read-only, this takes a minute or two)" >&2
+  draft_turn "$(compose dispatcher "$(draft_prompt "$text")")" >"$tmp" || die "claude failed (output so far: $tmp)"
+  if ! check_task_file "$tmp"; then
+    echo "herd: the draft has problems, asking for one fix:" >&2; sed 's/^/    /' <<<"${gate_msg%$'\n'}" >&2
+    draft_turn "herd could not use that task file:"$'\n'"$gate_msg"$'\n'"Reply with the whole corrected file, in the same format, and nothing else." >"$tmp" \
+      || die "claude failed (output so far: $tmp)"
+    check_task_file "$tmp" || { sed 's/^/    /' <<<"${gate_msg%$'\n'}" >&2; die "the draft still has problems, left in $tmp"; }
+  fi
+
+  if [[ $out == - ]]; then cat "$tmp"; rm -f "$tmp"; return; fi
+  { printf '# Drafted by herd draft on %s from:\n' "$(date +%F)"
+    sed 's/^/#   /' <<<"$text" | head -20
+    echo; cat "$tmp"; } >"$out"
+  rm -f "$tmp"
+  echo "wrote $out:" >&2
+  "${BASH_SOURCE[0]}" -n -r "$repo" -f "$out" | sed 's/^/  /' >&2
+  if [[ $out == "$repo/Tasks.herd" ]]; then echo "review it, then start it with: herd" >&2
+  else echo "review it, then start it with: herd -f $out" >&2; fi
+}
+
 case ${1:-} in
   ls) shift; cmd_ls; exit ;;
   personas) shift; [[ $# -le 1 ]] || die "personas takes at most one name"
@@ -740,6 +875,15 @@ case ${1:-} in
         [[ $# -eq 0 ]] || die "plan takes one branch and one plan"
       fi
       cmd_plan; exit ;;
+  draft) shift; out=""
+      while getopts "r:b:k:o:Fh" o; do case $o in
+        r) repo=$OPTARG;; b) base=$OPTARG;; k) kind=$OPTARG;; o) out=$OPTARG;; F) force=1;; h) usage; exit;; *) exit 2;; esac; done
+      shift $((OPTIND-1))
+      [[ $# -ge 1 && $1 != "--" ]] || die "draft needs a goal: the text itself, a file, or - for stdin"
+      draft_src=$1; shift
+      [[ ${1:-} != "--" ]] || { shift; agent_args=("$@"); set --; }
+      [[ $# -eq 0 ]] || die "draft takes one goal (quote it)"
+      cmd_draft; exit ;;
   rm) shift; while getopts "r:m:f:" o; do case $o in r) repo=$OPTARG;; m) machine=$OPTARG;; f) file=$OPTARG;; *) exit 2;; esac; done
       shift $((OPTIND-1)); targets=("$@"); [[ -z $file ]] || read_targets "$file"
       [[ ${#targets[@]} -gt 0 ]] || die "rm needs a branch or agent name (or -f file)"; cmd_rm "${targets[@]}"; exit ;;
