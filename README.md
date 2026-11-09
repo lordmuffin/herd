@@ -216,11 +216,34 @@ It then removes the worktree, closes the workspace, and deletes the local and re
 
 ## Install
 
-**CachyOS / Arch, as a package** (puts `herd` in `/usr/bin`, updates through `makepkg`):
+herd is developed on a private Forgejo and mirrored to
+[github.com/lordmuffin/herd](https://github.com/lordmuffin/herd); everything below uses the
+public GitHub copy. `herd --version` tells you what you have.
+
+**Release tarball** (any Linux; needs GNU coreutils for `install -D`). Download the tarball and
+`SHA256SUMS` from the [latest release](https://github.com/lordmuffin/herd/releases/latest):
 
 ```bash
-git clone ssh://git@git-ssh.apj.dev/lordmuffin/herd.git && cd herd
-makepkg -si          # rerun in this directory to update to the latest main
+sha256sum -c --ignore-missing SHA256SUMS
+tar xzf herd-X.Y.Z.tar.gz && cd herd-X.Y.Z
+make install                       # into ~/.local; PREFIX=/usr sudo make install for system-wide
+make uninstall                     # same PREFIX to remove
+```
+
+**Arch / CachyOS, from the release** (puts `herd` in `/usr/bin`). Each release has a prebuilt
+`herd-X.Y.Z-1-any.pkg.tar.zst` (`sudo pacman -U` it) and a `PKGBUILD` with the checksum filled in; or build the
+tagged version from `packaging/arch/herd/PKGBUILD` (its checksum is `SKIP`, so prefer the release one):
+
+```bash
+git clone https://github.com/lordmuffin/herd.git && cd herd/packaging/arch/herd
+makepkg -si
+```
+
+**Arch / CachyOS, tracking main** (`herd-git`; rerun to update to the latest main):
+
+```bash
+git clone https://github.com/lordmuffin/herd.git && cd herd
+makepkg -si
 ```
 
 **Dev checkout** (symlinks `~/.local/bin/herd` to this repo, so edits are live):
@@ -237,7 +260,7 @@ no `-D`), so use the dev checkout:
 
 ```bash
 brew install bash jq shellcheck
-git clone ssh://git@git-ssh.apj.dev/lordmuffin/herd.git && cd herd
+git clone https://github.com/lordmuffin/herd.git && cd herd
 make link            # git pull to update
 ```
 
@@ -250,3 +273,26 @@ doubled name is the `directories` crate's macOS layout), which `herd` checks aft
 
 `make test` runs `bash -n`, `shellcheck -S warning` and `tests/plan.sh` (the `herd plan` stage
 loop against a faked herdr), the same checks `makepkg` runs.
+
+## Publishing (maintainer notes)
+
+The canonical repo is the private Forgejo; GitHub is a read-only mirror that builds releases.
+`.github/workflows/ci.yml` runs `make test` on every push and pull request, and on a `v*` tag
+also builds the source tarball, an Arch package and `SHA256SUMS`, and attaches them (plus a
+`PKGBUILD` with the checksum filled in) to a GitHub Release.
+
+One-time setup:
+
+1. Create an empty `lordmuffin/herd` repo on GitHub (no README or license; Forgejo pushes those).
+2. Sync Forgejo to it, either way:
+   - **Push mirror (automatic).** In Forgejo: repo, Settings, Repository, Mirror settings, "Push
+     mirror". Git remote URL `https://github.com/lordmuffin/herd.git`, username `lordmuffin`,
+     password a GitHub fine-grained personal access token limited to that repo with
+     Contents: read and write. Enable "Sync when commits are pushed". Tags are mirrored too.
+   - **Manual.** `git remote add github git@github.com:lordmuffin/herd.git`, then
+     `make sync-github` pushes `main` and all tags.
+3. Releasing: bump `VERSION`, commit to main, then `git tag vX.Y.Z && git push origin main vX.Y.Z`.
+   Once the mirror carries the tag, the workflow tests it, checks it matches `VERSION`, and
+   publishes the release. `make dist` builds the same tarball locally into `dist/`.
+4. For the AUR, copy the release's `PKGBUILD` into an AUR `herd` repo and run
+   `makepkg --printsrcinfo > .SRCINFO`.
