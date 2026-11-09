@@ -4,17 +4,18 @@ pkgver=r1.0000000
 pkgrel=1
 pkgdesc="Fan out coding agents into git worktrees, one Herdr workspace each"
 arch=('any')
-url="https://git.apj.dev/lordmuffin/herd"
+url="https://github.com/lordmuffin/herd"
 license=('MIT')
 depends=('bash' 'git' 'jq' 'curl' 'util-linux')
 makedepends=('git')
 checkdepends=('shellcheck')
-optdepends=('forgejo-cli: Forgejo login used by herd done to check PR merge state')
+optdepends=('github-cli: PR merge check in herd done for github.com repos'
+            'forgejo-cli: Forgejo login used by herd done to check PR merge state')
 provides=('herd')
 conflicts=('herd')
-# Private repo: cloned over SSH with your own key. herdr itself is not packaged;
+# Public GitHub mirror; the canonical (private) repo is on Forgejo. herdr itself is not packaged;
 # install it from https://herdr.dev (it lands in ~/.local/bin).
-source=("herd::git+ssh://git@git-ssh.apj.dev/lordmuffin/herd.git")
+source=("herd::git+https://github.com/lordmuffin/herd.git")
 sha256sums=('SKIP')
 
 pkgver() {

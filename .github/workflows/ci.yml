@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck jq
+      - name: make test
+        run: make test
+
+  release:
+    # Only for version tags, and only once the tests pass.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the GitHub Release and upload its assets
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag must match the VERSION file
+        run: |
+          tag=${GITHUB_REF_NAME#v}
+          file=$(head -n1 VERSION)
+          if [ "$tag" != "$file" ]; then
+            echo "tag $GITHUB_REF_NAME does not match VERSION ($file); bump VERSION and re-tag" >&2
+            exit 1
+          fi
+          echo "VERSION=$file" >>"$GITHUB_ENV"
+
+      - name: Source tarball and checksums
+        run: make dist
+
+      - name: Arch package
+        run: |
+          # makepkg refuses to run as root, so build as an unprivileged user in an Arch container.
+          mkdir -p dist/arch
+          cp dist/herd-"$VERSION".tar.gz dist/arch/
+          sed -e "s/^pkgver=.*/pkgver=$VERSION/" \
+              -e "s/^sha256sums=.*/sha256sums=('$(cut -d' ' -f1 dist/SHA256SUMS)')/" \
+              packaging/arch/herd/PKGBUILD >dist/PKGBUILD
+          # Build from the local tarball, which is byte-identical to the release asset.
+          sed -e 's|^source=.*|source=("herd-$pkgver.tar.gz")|' dist/PKGBUILD >dist/arch/PKGBUILD
+          cp LICENSE dist/arch/
+          docker run --rm -v "$PWD/dist/arch:/build" archlinux:base-devel bash -c '
+            set -e
+            pacman -Syu --noconfirm --needed shellcheck jq git
+            useradd -m builder
+            chown -R builder /build
+            su builder -c "cd /build && makepkg -f --noconfirm"
+          '
+          cp dist/arch/*.pkg.tar.zst dist/
+          (cd dist && sha256sum herd-*.pkg.tar.zst >>SHA256SUMS)
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "herd $VERSION" --generate-notes \
+            dist/herd-"$VERSION".tar.gz dist/herd-*.pkg.tar.zst dist/SHA256SUMS dist/PKGBUILD

@@ -24,6 +24,7 @@
 #                                     # per parallel task; herd checks every line before it saves
 #                                     # Tasks.herd (or -o file, "-" for stdout; -F overwrites)
 #   herd ls                           # agents + their status
+#   herd version                      # print the version (also --version, -V)
 #   herd personas [<name>]            # list personas, or print one as a ready-to-paste prompt
 #   herd rm [-f file] <branch|name>...        # remove worktree, workspace and local branch
 #   herd done [-F] [-f file] <branch|name>... # after merge: check PR merged + agent idle + tree
@@ -71,6 +72,19 @@ script_dir() {
     src=$(readlink "$src"); [[ $src == /* ]] || src="$dir/$src"
   done
   (cd -P "$(dirname "$src")" && pwd)
+}
+
+# The version: the VERSION file next to a dev checkout, or the one make install put in share/herd.
+cmd_version() {
+  local d v f; d=$(script_dir "${BASH_SOURCE[0]}")
+  for f in "$d/../VERSION" "$d/../share/herd/VERSION"; do
+    [[ -f $f ]] || continue
+    v=$(head -n1 "$f")
+    # In a git checkout, say which commit this is, e.g. 0.1.0-3-gabc1234.
+    [[ $f == "$d/../VERSION" ]] && v=$(git -C "$d" describe --tags --match 'v*' --dirty 2>/dev/null || echo "$v")
+    echo "herd ${v#v}"; return
+  done
+  echo "herd unknown"
 }
 
 # Persona search path, most specific first. $repo may not be known yet; that entry is skipped.
@@ -850,6 +864,7 @@ cmd_draft() {
 }
 
 case ${1:-} in
+  version|--version|-V) cmd_version; exit ;;
   ls) shift; cmd_ls; exit ;;
   personas) shift; [[ $# -le 1 ]] || die "personas takes at most one name"
       repo=$(git rev-parse --show-toplevel 2>/dev/null || true); cmd_personas "$@"; exit ;;
