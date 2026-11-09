@@ -1,0 +1,162 @@
+# herd as a herdr plugin. Install with `herdr plugin install lordmuffin/herd`, or from a checkout
+# with `herdr plugin link .` (make plugin-link). Everything runs bin/herd from this directory, so
+# herd does not have to be on PATH.
+#
+# herdr 0.9.5 has no command palette for plugin actions: bind them to keys in
+# ~/.config/herdr/config.toml, then `herdr server reload-config`. One key for the menu is enough:
+#
+#   [[keys.command]]
+#   key = "prefix+h"
+#   type = "plugin_action"
+#   command = "lordmuffin.herd.menu"
+#   description = "herd"
+#
+# Or run any action from a shell: herdr plugin action invoke lordmuffin.herd.<id>
+#
+# Settings (agent kind, base ref, extra agent args, notifications) live in herd.conf under
+# `herdr plugin config-dir lordmuffin.herd`; the Settings action opens it.
+
+id = "lordmuffin.herd"
+name = "herd"
+version = "0.1.0"   # kept equal to VERSION; make test checks
+# Tested against 0.9.5. Uses plugin panes (incl. tab placement), workspace/agent/worktree APIs,
+# `notification show` and pane metadata tokens.
+min_herdr_version = "0.9.5"
+description = "Fan out coding agents into git worktrees, one workspace each; run staged plans; draft task files; clean up merged streams"
+platforms = ["linux", "macos"]
+
+# Every action opens the pane with the same id, in the focused pane's repo. version only notifies.
+[[actions]]
+id = "menu"
+title = "herd: Menu"
+description = "Every herd command in one picker"
+command = ["bash", "plugin/herd-plugin.sh", "action", "menu"]
+
+[[actions]]
+id = "fanout"
+title = "herd: Fan out a task file"
+description = "Start one agent per line of Tasks.herd (or another .herd file), each in its own worktree and workspace"
+command = ["bash", "plugin/herd-plugin.sh", "action", "fanout"]
+
+[[actions]]
+id = "draft"
+title = "herd: Draft a task file from a goal"
+description = "A read-only dispatcher agent splits a goal into Tasks.herd lines"
+command = ["bash", "plugin/herd-plugin.sh", "action", "draft"]
+
+[[actions]]
+id = "plan"
+title = "herd: Run a plan"
+description = "Run one plan as a chain of gated stages in one worktree, ending in one PR"
+command = ["bash", "plugin/herd-plugin.sh", "action", "plan"]
+
+[[actions]]
+id = "plan-resume"
+title = "herd: Resume a plan"
+description = "Pick up a plan that stopped on a block, a failed gate or a closed pane"
+command = ["bash", "plugin/herd-plugin.sh", "action", "plan-resume"]
+
+[[actions]]
+id = "status"
+title = "herd: Status"
+description = "This repo's streams: branch, agent, status, plan stage"
+command = ["bash", "plugin/herd-plugin.sh", "action", "status"]
+
+[[actions]]
+id = "done"
+title = "herd: Done (clean up merged streams)"
+description = "Remove worktree, workspace and branches of streams whose PR merged"
+command = ["bash", "plugin/herd-plugin.sh", "action", "done"]
+
+[[actions]]
+id = "rm"
+title = "herd: Discard streams"
+description = "Remove worktree, workspace and local branch without any checks"
+command = ["bash", "plugin/herd-plugin.sh", "action", "rm"]
+
+[[actions]]
+id = "personas"
+title = "herd: Personas"
+description = "List personas and read the prompt each one adds"
+command = ["bash", "plugin/herd-plugin.sh", "action", "personas"]
+
+[[actions]]
+id = "settings"
+title = "herd: Settings"
+description = "Edit herd.conf: agent kind, base ref, agent args, notifications"
+command = ["bash", "plugin/herd-plugin.sh", "action", "settings"]
+
+[[actions]]
+id = "version"
+title = "herd: Version"
+description = "Show the herd version as a notification"
+command = ["bash", "plugin/herd-plugin.sh", "action", "version"]
+
+# The interactive halves. Overlays close when the command exits; plans get a tab of their own,
+# because a plan's driver runs for as long as the plan does.
+[[panes]]
+id = "menu"
+title = "herd"
+placement = "overlay"
+command = ["bash", "plugin/herd-plugin.sh", "pane", "menu"]
+
+[[panes]]
+id = "fanout"
+title = "herd: fan out"
+placement = "overlay"
+command = ["bash", "plugin/herd-plugin.sh", "pane", "fanout"]
+
+[[panes]]
+id = "draft"
+title = "herd: draft"
+placement = "overlay"
+command = ["bash", "plugin/herd-plugin.sh", "pane", "draft"]
+
+[[panes]]
+id = "plan"
+title = "herd: plan"
+placement = "tab"
+command = ["bash", "plugin/herd-plugin.sh", "pane", "plan"]
+
+[[panes]]
+id = "plan-resume"
+title = "herd: plan"
+placement = "tab"
+command = ["bash", "plugin/herd-plugin.sh", "pane", "plan-resume"]
+
+[[panes]]
+id = "status"
+title = "herd: status"
+placement = "overlay"
+command = ["bash", "plugin/herd-plugin.sh", "pane", "status"]
+
+[[panes]]
+id = "done"
+title = "herd: done"
+placement = "overlay"
+command = ["bash", "plugin/herd-plugin.sh", "pane", "done"]
+
+[[panes]]
+id = "rm"
+title = "herd: discard"
+placement = "overlay"
+command = ["bash", "plugin/herd-plugin.sh", "pane", "rm"]
+
+[[panes]]
+id = "personas"
+title = "herd: personas"
+placement = "overlay"
+command = ["bash", "plugin/herd-plugin.sh", "pane", "personas"]
+
+[[panes]]
+id = "settings"
+title = "herd: settings"
+placement = "overlay"
+command = ["bash", "plugin/herd-plugin.sh", "pane", "settings"]
+
+# Agent status changes of herd's own streams: a sidebar token ($herd) and, per HERD_NOTIFY, a
+# notification when a whole fan-out batch has finished or an agent needs input. Other panes are
+# ignored. Output lands in `herdr plugin log list --plugin lordmuffin.herd`.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["bash", "plugin/herd-plugin.sh", "event"]

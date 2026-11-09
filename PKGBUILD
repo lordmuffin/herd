@@ -10,11 +10,13 @@ depends=('bash' 'git' 'jq' 'curl' 'util-linux')
 makedepends=('git')
 checkdepends=('shellcheck')
 optdepends=('github-cli: PR merge check in herd done for github.com repos'
+            'fzf: pickers in the herdr plugin'
             'forgejo-cli: Forgejo login used by herd done to check PR merge state')
 provides=('herd')
 conflicts=('herd')
 # Public GitHub mirror; the canonical (private) repo is on Forgejo. herdr itself is not packaged;
-# install it from https://herdr.dev (it lands in ~/.local/bin).
+# install it from https://herdr.dev (it lands in ~/.local/bin). The herd herdr plugin is installed
+# to /usr/share/herd; register it with: herdr plugin link /usr/share/herd
 source=("herd::git+https://github.com/lordmuffin/herd.git")
 sha256sums=('SKIP')
 
