@@ -53,6 +53,7 @@ can run it from a shell with `herdr plugin action invoke lordmuffin.herd.<id>`:
 | action | what it does |
 | --- | --- |
 | `menu` | a picker for every action below |
+| `dashboard` | a live, full-screen view of the repo's streams, with actions; see below |
 | `fanout` | picks `Tasks.herd` or another `*.herd` file in the repo root, asks for a default persona, shows the dry run, and starts the agents once you say yes |
 | `draft` | asks for a goal (one line, or typed in `$EDITOR`) and an output file, runs `herd draft`, then offers to fan the result out |
 | `plan` | asks for a branch, a plan (a `*.md` in the repo root, or typed in `$EDITOR`), a default `verify:` command and the stage persona, then runs `herd plan` in a tab of its own |
@@ -69,6 +70,60 @@ tab, because its driver runs as long as the plan does. If you close that tab, th
 where it is; `plan-resume` picks it up. Pickers use `fzf` when it is installed, and numbers when
 it isn't.
 
+**The dashboard.** `dashboard` opens a tab in the repo's own workspace, also when you press its
+key in one of the streams. Pressing it again goes back to the open one. Give it a key of its own:
+
+```toml
+[[keys.command]]
+key = "prefix+H"
+type = "plugin_action"
+command = "lordmuffin.herd.dashboard"
+description = "herd dashboard"
+```
+
+```text
+herd  ~/git/shop   3 stream(s): 1 blocked · 1 working · 1 idle                      14:02:11
+------------------------------------------------------------------------------------------
+  BRANCH                             STATUS    PLAN                   WORKSPACE
+  feat/export-csv                    working   stage 2/3 running      w5
+> fix/login-redirect                 blocked   -                      w6
+  docs/api                           idle      -                      w7
+
+fix/login-redirect   agent fix-login-redirect (blocked)   ~/git/wt/shop/fix-login-redirect
+git
+  2 commit(s) ahead of origin/main · 1 uncommitted file(s)
+  last: 4be1a2c fix: keep the next= param through login (3 minutes ago)
+agent screen (s for more)
+  Do you want to make this edit to src/auth/redirect.ts?
+  > 1. Yes
+    2. Yes, and don't ask again this session
+    3. No, and tell Claude what to do differently
+enter go  d done  x discard  r resume  f fan out  n draft  p plan  v diff  s screen  ? keys  q quit
+```
+
+The list shows each stream's branch, agent status, plan stage and workspace. Below it is the
+selected stream: its plan's stages (`✓` done, `▶` current, `!` stopped there, `·` to come), how
+far it is ahead of `HERD_BASE`, uncommitted files, the last lines of `.herd/run/PROGRESS.md`, and
+the end of its agent's screen. Keys:
+
+| key | does |
+| --- | --- |
+| `j` `k`, arrows | select a stream |
+| `enter`, `o` | go to the stream: its workspace, else its agent, else reopen its worktree |
+| `s` | the agent's screen, in `less` |
+| `v` | commits and diff against `HERD_BASE`, in `less` |
+| `l` | the plan's `PROGRESS.md`, in `less` |
+| `d` | `herd done` on the stream, after a yes; the merge checks are unchanged |
+| `x` | discard the stream, after you type `discard` |
+| `r` | resume the stream's plan, in a tab of its own |
+| `f` `n` `p` | fan out, draft, or start a plan (the same forms as the actions) |
+| `g`, `?`, `q` | refresh, keys, close |
+
+To answer a blocked agent, go to it with `enter`; the dashboard doesn't press its keys for you.
+The dashboard reloads when the event hook sees one of herd's agents change status or a
+worktree come or go, and every 5 seconds anyway (`HERD_DASH_POLL` in `herd.conf`). It is bash and
+`jq` like the rest of herd, so there is nothing to build or install.
+
 **Settings.** `herd.conf` lives in `herdr plugin config-dir lordmuffin.herd`. The `settings`
 action creates it with every option commented out:
 
@@ -81,6 +136,7 @@ action creates it with every option commented out:
 | `HERD_DRAFT_ARGS` | none | args for `draft`'s headless claude |
 | `HERD_NOTIFY` | `batch` | `batch`, `all` or `off`; see below |
 | `HERD_SIDEBAR` | `1` | report the `$herd` sidebar token |
+| `HERD_DASH_POLL` | `5` | seconds between the dashboard's reloads when no event comes sooner |
 
 **Notifications and the sidebar.** herd hooks `pane.agent_status_changed`, but only for agents in
 its own worktrees (`~/git/wt/<repo>/...`). With `HERD_NOTIFY=batch`, you get one notification
