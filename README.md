@@ -10,6 +10,7 @@ herd -f other.herd                                         # a batch from any ot
 herd draft "Add CSV export and document it"                # write Tasks.herd from a goal
 herd -n                                                    # dry run: what would start, and as what
 herd ls                                                    # agents and their status
+herd status                                                # this repo's streams, with plan stages
 herd done fix/foo                                          # after merge: remove worktree + branches
 herd done                                                  # close the whole Tasks.herd batch
 herd rm fix/foo                                            # discard a stream (no checks)
@@ -20,6 +21,87 @@ herd plan -R feat/big                                      # resume a plan that 
 
 `herd -h` lists every option. `examples/Tasks.example.herd` shows the useful task shapes:
 plan-only, investigate-only, fix-to-PR, docs-only and review-only.
+
+Everything above also works from inside herdr, without the `herd` command: see
+[herdr plugin](#herdr-plugin), the recommended way to install herd.
+
+## herdr plugin
+
+herd is a [herdr plugin](https://herdr.dev/docs/plugins/). Install it into herdr, and herdr runs
+herd for you: `herd` doesn't need to be on `PATH`, and you don't need a pane to run it from.
+
+```bash
+herdr plugin install lordmuffin/herd      # from GitHub; add --ref vX.Y.Z to pin a release
+herdr plugin link /path/to/herd           # or a local checkout (make plugin-link)
+```
+
+herdr 0.9.5 has no command palette for plugin actions, so bind a key to herd's menu in
+`~/.config/herdr/config.toml`, then run `herdr server reload-config`:
+
+```toml
+[[keys.command]]
+key = "prefix+h"
+type = "plugin_action"
+command = "lordmuffin.herd.menu"
+description = "herd"
+```
+
+Every action works on the repo of the focused pane. From one of herd's worktrees, that is the
+main checkout. Each action can also have its own key (`command = "lordmuffin.herd.<id>"`), or you
+can run it from a shell with `herdr plugin action invoke lordmuffin.herd.<id>`:
+
+| action | what it does |
+| --- | --- |
+| `menu` | a picker for every action below |
+| `fanout` | picks `Tasks.herd` or another `*.herd` file in the repo root, asks for a default persona, shows the dry run, and starts the agents once you say yes |
+| `draft` | asks for a goal (one line, or typed in `$EDITOR`) and an output file, runs `herd draft`, then offers to fan the result out |
+| `plan` | asks for a branch, a plan (a `*.md` in the repo root, or typed in `$EDITOR`), a default `verify:` command and the stage persona, then runs `herd plan` in a tab of its own |
+| `plan-resume` | lists plans that stopped (on a block, a failed gate or a closed tab) and resumes the one you pick |
+| `status` | the repo's streams: branch, agent, agent status, plan stage. Refreshes every 10 s |
+| `done` | pick streams and run `herd done` on them; the merge checks are unchanged |
+| `rm` | pick streams and discard them with no checks, after you type `discard` |
+| `personas` | lists personas and shows the prompt each one adds |
+| `settings` | opens `herd.conf` in `$EDITOR` |
+| `version` | shows the herd version as a notification |
+
+Most actions open as an overlay on the focused pane and close when you're done. A plan gets a
+tab, because its driver runs as long as the plan does. If you close that tab, the plan stops
+where it is; `plan-resume` picks it up. Pickers use `fzf` when it is installed, and numbers when
+it isn't.
+
+**Settings.** `herd.conf` lives in `herdr plugin config-dir lordmuffin.herd`. The `settings`
+action creates it with every option commented out:
+
+| setting | default | |
+| --- | --- | --- |
+| `HERD_KIND` | `claude` | agent kind (`-k`) |
+| `HERD_BASE` | `origin/main` | base ref (`-b`) |
+| `HERD_PERSONA` | none | persona for task lines without `@persona`, and the plan default |
+| `HERD_AGENT_ARGS` | none | args for every agent (`-- <args>`), e.g. `"--permission-mode auto"` so a plan runs unattended |
+| `HERD_DRAFT_ARGS` | none | args for `draft`'s headless claude |
+| `HERD_NOTIFY` | `batch` | `batch`, `all` or `off`; see below |
+| `HERD_SIDEBAR` | `1` | report the `$herd` sidebar token |
+
+**Notifications and the sidebar.** herd hooks `pane.agent_status_changed`, but only for agents in
+its own worktrees (`~/git/wt/<repo>/...`). With `HERD_NOTIFY=batch`, you get one notification
+when every agent of a fan-out has finished, and one when a plan ends or stops. `all` adds one
+for each agent that finishes or starts waiting for input. herdr's own toasts for agents in other
+tabs (`[ui.toast]`) are separate. herd also reports a `herd` token on its agents' panes: the
+branch, or a plan's stage (`stage 2/4 running`). To show it, add `$herd` to a sidebar row:
+
+```toml
+[ui.sidebar.agents]
+rows = [
+  ["state_icon", "machine", "workspace", "tab"],
+  ["agent", "$herd"],
+]
+```
+
+The plugin runs `bin/herd` from its own directory, with the same personas, task files and
+`.herd/run/` state, so the plugin and the CLI can be mixed freely. The CLI still has a few things
+the plugin doesn't: `-m` remote machines, `-p` parent workspace, and explicit
+`branch prompt` pairs on the command line. Event hook and action output is in
+`herdr plugin log list --plugin lordmuffin.herd`.
 
 ## Tasks.herd
 
@@ -202,8 +284,9 @@ It then removes the worktree, closes the workspace, and deletes the local and re
 
 ## Requirements
 
-- [herdr](https://herdr.dev), run from inside a Herdr pane;
-- `bash`, `git`, `jq` and `curl`;
+- [herdr](https://herdr.dev). The plugin needs herdr 0.9.5 or newer. The CLI runs from inside a
+  Herdr pane;
+- `bash` 4 or newer, `git`, `jq` and `curl` (`fzf` is optional, for the plugin's pickers);
 - `column` (from util-linux);
 - for `herd done` and the PR check in `herd plan`: `gh` (logged in) for repos on github.com, and for
   any other host a Forgejo login via [forgejo-cli](https://codeberg.org/forgejo-contrib/forgejo-cli).
@@ -218,7 +301,17 @@ It then removes the worktree, closes the workspace, and deletes the local and re
 
 herd is developed on a private Forgejo and mirrored to
 [github.com/lordmuffin/herd](https://github.com/lordmuffin/herd); everything below uses the
-public GitHub copy. `herd --version` tells you what you have.
+public GitHub copy. `herd --version` (or the plugin's `version` action) tells you what you have.
+
+**herdr plugin (recommended)**. No `herd` on `PATH` needed. See [herdr plugin](#herdr-plugin):
+
+```bash
+herdr plugin install lordmuffin/herd   # herdr plugin update lordmuffin.herd to update
+```
+
+Every install below also puts the plugin in `<prefix>/share/herd`. To use the plugin and the
+CLI from one install, register that copy instead: `herdr plugin link /usr/share/herd` for a
+package, or `herdr plugin link ~/.local/share/herd` after `make install`.
 
 **Release tarball** (any Linux; needs GNU coreutils for `install -D`). Download the tarball and
 `SHA256SUMS` from the [latest release](https://github.com/lordmuffin/herd/releases/latest):
@@ -303,7 +396,13 @@ WSL2 unless you want to experiment.
 ## Develop
 
 `make test` runs `bash -n`, `shellcheck -S warning` and `tests/plan.sh` (the `herd plan` stage
-loop against a faked herdr), the same checks `makepkg` runs.
+loop against a faked herdr), the same checks `makepkg` runs. `tests/plugin.sh` checks
+`herdr-plugin.toml` against herdr's manifest rules (with `python3`'s `tomllib` where available)
+and drives every plugin action, pane and the event hook against a fake herdr.
+
+The plugin is `herdr-plugin.toml` and `plugin/herd-plugin.sh`, which calls `bin/herd`.
+`make plugin-link` registers this checkout with herdr (edits are live), and `make plugin-unlink`
+removes it again.
 
 ## Publishing (maintainer notes)
 
@@ -332,3 +431,6 @@ One-time setup:
    mirror pushes with `--mirror` and can delete GitHub-only tags, so fetch them back first.
 4. For the AUR, copy the release's `PKGBUILD` into an AUR `herd` repo and run
    `makepkg --printsrcinfo > .SRCINFO`.
+5. For the [herdr plugin marketplace](https://herdr.dev/plugins/), add the `herdr-plugin` topic to
+   the GitHub repo; its index finds `herdr-plugin.toml` at the root. Keep the manifest's
+   `version` equal to `VERSION` (`make test` checks this).

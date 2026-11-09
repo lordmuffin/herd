@@ -11,9 +11,12 @@ license=('MIT')
 depends=('bash' 'git' 'jq' 'curl' 'util-linux')
 checkdepends=('shellcheck')
 optdepends=('github-cli: PR merge check in herd done for github.com repos'
+            'fzf: pickers in the herdr plugin'
             'forgejo-cli: Forgejo login used by herd done to check PR merge state')
 conflicts=('herd-git')
 # herdr itself is not packaged; install it from https://herdr.dev (it lands in ~/.local/bin).
+# The herd herdr plugin is installed to /usr/share/herd; register it with:
+#   herdr plugin link /usr/share/herd
 source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
 sha256sums=('SKIP')  # replaced by the release workflow; see SHA256SUMS on the release
 

@@ -3,19 +3,23 @@ BIN    := $(DESTDIR)$(PREFIX)/bin
 SHARE  := $(DESTDIR)$(PREFIX)/share/herd
 VERSION := $(shell head -n1 VERSION)
 GITHUB_REMOTE ?= github
+HERDR  ?= herdr
 
-.PHONY: test install link uninstall dist sync-github clean
+.PHONY: test install link uninstall plugin-link plugin-unlink dist sync-github clean
 
 test:
 	bash -n bin/herd
-	shellcheck -S warning bin/herd tests/plan.sh tests/worktree.sh tests/pr.sh tests/args.sh tests/version.sh
+	bash -n plugin/herd-plugin.sh
+	shellcheck -S warning bin/herd plugin/herd-plugin.sh tests/plan.sh tests/worktree.sh tests/pr.sh tests/args.sh tests/version.sh tests/plugin.sh
 	bash tests/plan.sh
 	bash tests/worktree.sh
 	bash tests/pr.sh
 	bash tests/args.sh
 	bash tests/version.sh
+	bash tests/plugin.sh
 
-# Copy into $(PREFIX) (default ~/.local). PKGBUILD uses this with PREFIX=/usr.
+# Copy into $(PREFIX) (default ~/.local). PKGBUILD uses this with PREFIX=/usr. The herdr plugin
+# lands in share/herd too, so `herdr plugin link $(PREFIX)/share/herd` registers it.
 install:
 	install -Dm755 bin/herd $(BIN)/herd
 	install -Dm644 VERSION $(SHARE)/VERSION
@@ -23,6 +27,8 @@ install:
 	install -Dm644 examples/plan.example.md $(SHARE)/plan.example.md
 	mkdir -p $(SHARE)/personas
 	install -m644 personas/*.md $(SHARE)/personas/
+	install -Dm644 herdr-plugin.toml $(SHARE)/herdr-plugin.toml
+	install -Dm755 plugin/herd-plugin.sh $(SHARE)/plugin/herd-plugin.sh
 
 # Dev install: symlink, so edits in this checkout are live.
 link:
@@ -32,6 +38,13 @@ link:
 uninstall:
 	rm -f $(BIN)/herd
 	rm -rf $(SHARE)
+
+# Register this checkout as herd's herdr plugin (edits are live, as with link), or unregister it.
+plugin-link:
+	$(HERDR) plugin link $(CURDIR)
+
+plugin-unlink:
+	$(HERDR) plugin unlink lordmuffin.herd
 
 # Source tarball of HEAD plus SHA256SUMS in dist/ (what the release workflow publishes).
 dist:

@@ -24,6 +24,8 @@
 #                                     # per parallel task; herd checks every line before it saves
 #                                     # Tasks.herd (or -o file, "-" for stdout; -F overwrites)
 #   herd ls                           # agents + their status
+#   herd status [-j] [-r repo]        # this repo's streams: branch, agent, status, plan stage
+#                                     # (-j: one JSON object per stream)
 #   herd version                      # print the version (also --version, -V)
 #   herd personas [<name>]            # list personas, or print one as a ready-to-paste prompt
 #   herd rm [-f file] <branch|name>...        # remove worktree, workspace and local branch
@@ -55,7 +57,7 @@
 set -euo pipefail
 
 repo="" base="origin/main" kind="claude" machine="" parent="" parent_ws="" wait=0 force=0 file="" agent_args=() targets=()
-persona="" dry=0 bg_wait=60 bg_poll=${HERD_BG_POLL:-30}
+persona="" dry=0 json=0 bg_wait=60 bg_poll=${HERD_BG_POLL:-30}
 
 die() { echo "herd: $*" >&2; exit 1; }
 h() { if [[ -n $machine ]]; then herdr --machine "$machine" "$@"; else herdr "$@"; fi; }
@@ -284,7 +286,9 @@ cmd_done() {
   local into=${base#origin/} pr status dirty
   for target in "$@"; do
     find_wt "$target" || continue
-    pr=$(pr_lookup "$into" "$branch"); case $? in
+    # `|| rc=$?`: under set -e a bare failing assignment would end the run before the case.
+    local rc=0; pr=$(pr_lookup "$into" "$branch") || rc=$?
+    case $rc in
       0) ;;
       1) echo "herd: $branch has no PR into $into — not removing (use herd rm to discard)" >&2; continue ;;
       *) echo "herd: can't check $branch's PR — not removing (use herd rm to discard)" >&2; continue ;;
@@ -730,6 +734,45 @@ cmd_plan() {
   drive_plan
 }
 
+# A plan's place, from <worktree>/.herd/run: "stage 2/4 running", "complete", or nothing.
+plan_label() {
+  local r=$1/.herd/run s st n
+  [[ -f $r/state ]] || return 0
+  s=$(sed -n 's/^stage=//p' "$r/state") st=$(sed -n 's/^status=//p' "$r/state")
+  if [[ $st == complete ]]; then echo complete; return; fi
+  if [[ -f $r/stages.md ]]; then n=$(stage_field "$r/stages.md" 0); else n="?"; fi
+  if [[ ${s:-0} == 0 ]]; then echo "$st"; else echo "stage $s/$n $st"; fi
+}
+
+# herd's streams in $repo — the linked worktrees under ~/git/wt/<repo>/ — with each one's agent,
+# its status and, for a plan, where it is. -j prints one JSON object per stream instead.
+cmd_status() {
+  [[ -n $repo ]] || repo=$(git rev-parse --show-toplevel)
+  local wts agents path branch ws name st plan rows="" main
+  # Streams are named after the main checkout, also when this runs in one of its worktrees.
+  main=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir) || die "$repo is not a git repo"
+  [[ $(basename "$main") == .git ]] && main=$(dirname "$main")
+  wts=$(h worktree list --cwd "$repo") || die "could not list worktrees of $repo"
+  agents=$(h agent list 2>/dev/null) || agents='{"result":{"agents":[]}}'
+  while IFS=$'\t' read -r path branch ws; do
+    name=$(agent_name "$branch")
+    st=$(jq -r --arg p "$path" '[.result.agents[] | select(.cwd == $p or (.cwd | startswith($p + "/")))
+           | .agent_status][0] // "-"' <<<"$agents")
+    plan=$(plan_label "$path")
+    if ((json)); then
+      jq -cn --arg b "$branch" --arg a "$name" --arg s "$st" --arg pl "$plan" --arg p "$path" --arg w "$ws" \
+        '{branch: $b, agent: $a, status: $s, plan: $pl, path: $p, workspace: $w}'
+    else
+      rows+=$(printf '%s\t%s\t%s\t%s\t%s' "$branch" "$name" "$st" "${plan:--}" "$ws")$'\n'
+    fi
+  done < <(jq -r --arg pre "$HOME/git/wt/$(basename "$main")/" '.result.worktrees[]
+             | select(.is_linked_worktree and (.path | startswith($pre)))
+             | [.path, .branch // "-", .open_workspace_id // "-"] | @tsv' <<<"$wts")
+  ((json)) && return
+  if [[ -z $rows ]]; then echo "no herd streams in $repo"; return; fi
+  { printf 'BRANCH\tAGENT\tSTATUS\tPLAN\tWORKSPACE\n'; printf '%s' "$rows"; } | column -t -s $'\t'
+}
+
 # Sourced (by tests/plan.sh): define the functions above, run nothing.
 [[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
 
@@ -858,7 +901,7 @@ cmd_draft() {
     echo; cat "$tmp"; } >"$out"
   rm -f "$tmp"
   echo "wrote $out:" >&2
-  "${BASH_SOURCE[0]}" -n -r "$repo" -f "$out" | sed 's/^/  /' >&2
+  "$BASH" "${BASH_SOURCE[0]}" -n -r "$repo" -f "$out" | sed 's/^/  /' >&2
   if [[ $out == "$repo/Tasks.herd" ]]; then echo "review it, then start it with: herd" >&2
   else echo "review it, then start it with: herd -f $out" >&2; fi
 }
@@ -866,6 +909,8 @@ cmd_draft() {
 case ${1:-} in
   version|--version|-V) cmd_version; exit ;;
   ls) shift; cmd_ls; exit ;;
+  status) shift; json=0; while getopts "r:j" o; do case $o in r) repo=$OPTARG;; j) json=1;; *) exit 2;; esac; done
+      repo=${repo:-$(git rev-parse --show-toplevel)}; repo=$(cd "$repo" && git rev-parse --show-toplevel); cmd_status; exit ;;
   personas) shift; [[ $# -le 1 ]] || die "personas takes at most one name"
       repo=$(git rev-parse --show-toplevel 2>/dev/null || true); cmd_personas "$@"; exit ;;
   "done") shift; while getopts "r:b:Ff:" o; do case $o in r) repo=$OPTARG;; b) base=$OPTARG;; F) force=1;; f) file=$OPTARG;; *) exit 2;; esac; done
