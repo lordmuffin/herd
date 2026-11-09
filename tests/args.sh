@@ -5,6 +5,7 @@
 #   bash tests/args.sh        (make test runs it)
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 herd=$here/../bin/herd
+export HERD_BACKEND=tui   # the fake herdr below, also when run in the Herdr app
 
 pass=0 fail=0
 ok() { pass=$((pass + 1)); echo "  ok   $1"; }
