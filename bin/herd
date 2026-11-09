@@ -1081,7 +1081,7 @@ cmd_serve() {
   done
   conf=$(herd_conf)
   HERD_SERVE_LISTEN="" HERD_SERVE_PORT=8380 HERD_SERVE_READ_ONLY=0 HERD_SERVE_HOSTS=""
-  HERD_BASE=origin/main
+  HERD_BASE=origin/main HERD_RELAY_APP_URL=""
   # shellcheck source=/dev/null
   [[ -f $conf ]] && source "$conf"
   d=$(script_dir "${BASH_SOURCE[0]}")
@@ -1094,7 +1094,8 @@ cmd_serve() {
   [[ -n $py && -n $web ]] || die "serve: cannot find serve/herd_serve.py and web/ next to $d"
   have python3 || die "serve: needs python3 (herd itself doesn't; only herd serve does)"
   args=(--port "${port:-$HERD_SERVE_PORT}" --state-dir "$(serve_state_dir)" --web "$web"
-        --base "$HERD_BASE" --hosts "$HERD_SERVE_HOSTS")
+        --base "$HERD_BASE" --hosts "$HERD_SERVE_HOSTS" --relay-app-url "$HERD_RELAY_APP_URL"
+        --relay-host "$(herd_host)")
   # Only a --listen given here counts as explicit; the server refuses a non-loopback address from
   # herd.conf alone.
   if [[ -n $listen ]]; then args+=(--listen "$listen")

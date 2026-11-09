@@ -147,6 +147,40 @@ check "/static/* serves web/" test "$code" = 200
 get /static/../bin/herd --path-as-is
 check "/static/ can't climb out of web/" test "$code" = 404
 
+# --- the page ---------------------------------------------------------------------------------------
+echo "page"
+# ctype <path>: GET it and set $ctype to its Content-Type.
+ctype() { ctype=$(curl -s -o "$T/out" -w '%{content_type}' --max-time 10 "http://127.0.0.1:$port$1"); }
+get /
+check "/ is the page, with its script, stylesheet and manifest" \
+  bash -c "grep -q 'src=\"/static/app.js\"' '$T/out' && grep -q 'href=\"/static/app.css\"' '$T/out' && grep -q 'rel=\"manifest\"' '$T/out'"
+ctype /static/app.js
+check "app.js is text/javascript" bash -c "[[ '$ctype' == text/javascript* ]] && grep -q EventSource '$T/out'"
+ctype /static/app.css
+check "app.css is text/css" bash -c "[[ '$ctype' == text/css* ]]"
+ctype /static/manifest.webmanifest
+check "the manifest is application/manifest+json" bash -c "[[ '$ctype' == application/manifest+json* ]]"
+check "...named herd, standalone, with a 192 and a 512 icon" \
+  jqt '.name == "herd" and .display == "standalone" and .theme_color and ([.icons[].sizes] | index("192x192") and index("512x512"))'
+ok_icons=1
+for src in $(jq -r '.icons[].src' "$T/out"); do
+  [[ $(curl -s -o /dev/null -w '%{http_code} %{content_type}' "http://127.0.0.1:$port$src") == "200 image/png" ]] || ok_icons=0
+done
+check "...whose icons are served as PNGs" test "$ok_icons" = 1
+ctype /sw.js
+check "the service worker is at /sw.js, as text/javascript" bash -c "[[ '$ctype' == text/javascript* ]] && grep -q 'addEventListener(\"fetch\"' '$T/out'"
+check "...that skips /api and lists no /api route in its shell" bash -c "grep -qF 'pathname.startsWith(\"/api/\")' '$T/out' && ! sed -n '/^const SHELL/,/];/p' '$T/out' | grep -q /api"
+# No CDN, no third-party anything: the page talks to this server only.
+check "app.js, sw.js and the page have no external URLs" bash -c "! grep -nE 'https?://|//[a-z0-9.-]+\\.[a-z]{2,}/' '$root/web/app.js' '$root/web/sw.js' '$root/web/index.html' '$root/web/app.css'"
+
+echo "config"
+get /api/config
+check "/api/config needs a token" test "$code" = 401
+get /api/config -H "Authorization: Bearer $reader"
+check "/api/config holds only the relay settings" jqt 'keys == ["relay_app_url", "relay_host"]'
+check "...with no app URL when herd.conf sets none" jqt '.relay_app_url == null and (.relay_host | length > 0)'
+check "...and no token" bash -c "! grep -qF -e '$reader' -e '$controller' '$T/out'"
+
 # --- events ---------------------------------------------------------------------------------------
 echo "events"
 get /api/events --max-time 2
@@ -171,6 +205,18 @@ for ((i = 0; i < 50; i++)); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; d
 wait "$pid"; rc=$?
 check "exits cleanly on SIGTERM" test "$rc" = 0
 check "...and says so" grep -q 'stopped' "$T/log"
+
+echo "config from herd.conf"
+printf 'HERD_BASE=main\nHERD_RELAY_APP_URL=https://relay.example/app/\nHERD_RELAY_HOST=lap\n' >"$HERD_CONF"
+start
+get /api/config -H "Authorization: Bearer $reader"
+check "HERD_RELAY_APP_URL and HERD_RELAY_HOST reach /api/config" \
+  jqt '. == {"relay_app_url": "https://relay.example/app/", "relay_host": "lap"}'
+check "...and nothing secret does" bash -c "! grep -qF -e '$reader' -e '$controller' '$T/out'"
+get /api/snapshot -H "Authorization: Bearer $reader"
+check "the streams carry the same host" jqt '.repos[0].streams[0].host == "lap"'
+stop
+printf 'HERD_BASE=main\n' >"$HERD_CONF"
 
 echo "listen"
 start --read-only; rc=$?

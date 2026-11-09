@@ -9,6 +9,8 @@ and serves that JSON as it is. docs/serve-api.md has the contract.
   GET /api/snapshot  `herd status -j -a`, cached for 2 s
   GET /api/show      `herd show -j <repo> <branch> <what>`, for a stream of the snapshot
   GET /api/events    Server-Sent Events: a `snapshot` event when it changes
+  GET /api/config    the page's non-secret settings: the relay app URL and this host's name
+  GET /sw.js         web/sw.js, at the root so the service worker's scope is the whole page
   GET /healthz       ok, no auth
 
 Every /api route needs `Authorization: Bearer <token>` (reader or controller, from
@@ -215,9 +217,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.api_show(query)
             if path == "/api/events":
                 return self.api_events()
+            if path == "/api/config":
+                return self.send_json(200, self.app.config)
             return self.send_json(404, {"error": "no such route"})
         if path == "/" or path == "/index.html":
             return self.static("index.html")
+        if path == "/sw.js":
+            return self.static("sw.js")
         if path.startswith("/static/"):
             return self.static(path[len("/static/"):])
         return self.send(404, "not found\n")
@@ -313,6 +319,10 @@ class App:
         self.hosts = {"localhost", args.listen.lower()}
         self.hosts.update(h.strip().lower() for h in args.hosts.replace(",", " ").split() if h.strip())
         self.tokens = None
+        # Only these reach the page through /api/config: nothing secret, and nothing the relay
+        # keeps in its own config (herd.conf's HERD_RELAY_APP_URL and HERD_RELAY_HOST).
+        self.config = {"relay_app_url": args.relay_app_url or None,
+                       "relay_host": args.relay_host or socket.gethostname().split(".")[0]}
 
 
 def parse_args(argv):
@@ -324,6 +334,8 @@ def parse_args(argv):
     p.add_argument("--hosts", default="", help="more Host names to accept (HERD_SERVE_HOSTS)")
     p.add_argument("--state-dir", required=True)
     p.add_argument("--web", required=True, help="the web/ directory")
+    p.add_argument("--relay-app-url", default="", help="the Herdr Mobile app's URL (HERD_RELAY_APP_URL)")
+    p.add_argument("--relay-host", default="", help="this machine's name in the relay (HERD_RELAY_HOST)")
     p.add_argument("--base", default="origin/main", help="base ref for herd status and show")
     p.add_argument("--herd", nargs="+", required=True, help="argv that runs bin/herd (last flag)")
     args = p.parse_args(argv)

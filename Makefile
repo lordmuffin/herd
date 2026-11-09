@@ -32,9 +32,10 @@ install:
 	install -Dm644 examples/plan.example.md $(SHARE)/plan.example.md
 	mkdir -p $(SHARE)/personas
 	install -m644 personas/*.md $(SHARE)/personas/
-	mkdir -p $(SHARE)/serve $(SHARE)/web
+	mkdir -p $(SHARE)/serve $(SHARE)/web/icons
 	install -m644 serve/*.py $(SHARE)/serve/
 	install -m644 web/*.* $(SHARE)/web/
+	install -m644 web/icons/*.* $(SHARE)/web/icons/
 	install -Dm644 herdr-plugin.toml $(SHARE)/herdr-plugin.toml
 	install -Dm755 plugin/herd-plugin.sh $(SHARE)/plugin/herd-plugin.sh
 	install -Dm644 plugin/dashboard.sh $(SHARE)/plugin/dashboard.sh

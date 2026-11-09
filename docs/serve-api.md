@@ -134,10 +134,12 @@ command below and exports `HERD_RELAY_HOST`.
 | route | auth | answer |
 | --- | --- | --- |
 | `GET /`, `GET /static/<file>` | none | `web/index.html`, `web/<file>` |
+| `GET /sw.js` | none | `web/sw.js`, the page's service worker, at the root so its scope is the whole page |
 | `GET /healthz` | none | `ok` |
 | `GET /api/snapshot` | token | `herd status -j -a`, reused for 2 s (or until the nudge file changes) |
 | `GET /api/show?repo=&branch=&what=` | token | `herd show -j`; 404 unless `repo` is a `repos[].path` of the snapshot and `branch` one of its streams, 400 for a bad `what` |
 | `GET /api/events` | token, or `?t=<token>` | Server-Sent Events, below |
+| `GET /api/config` | token | `{relay_app_url, relay_host}`: herd.conf's `HERD_RELAY_APP_URL` (null when unset) and `HERD_RELAY_HOST` (else `hostname -s`), for the page's Herdr Mobile links. Nothing else, and never a token |
 
 A failing herd command is a 502 with `{error}`; every /api answer is `Cache-Control: no-store`.
 
@@ -157,6 +159,14 @@ yet: every POST is a 405).
 **Host check.** A request whose `Host` is not the bound address, `localhost` or a
 `HERD_SERVE_HOSTS` entry (space or comma separated) is a 403, `/healthz` included. This stops DNS
 rebinding.
+
+**The page.** `web/` holds `index.html`, `app.js`, `app.css`, `manifest.webmanifest`, `sw.js` and
+`icons/` (PNGs made from `icons/icon.svg` with `rsvg-convert -w N`). No build step and no URL but
+this server's. A device pairs by opening the page with `#t=<token>`: the page keeps the token in
+localStorage, drops the fragment from the address bar, and sends the token as a bearer header
+(and as `?t=` to `/api/events`). Every stream links to the Herdr Mobile app with the relay's deep
+link, `<relay_app_url>#notify=<encodeURIComponent(JSON.stringify({pane_id, host}))>`, using the
+stream's `pane_id` and `host`. The service worker caches the shell only, never an /api answer.
 
 **Off loopback.** A non-loopback address needs `--listen` on the command line (one from herd.conf
 alone is refused) and the tokens file to exist already (start once on loopback to make it).

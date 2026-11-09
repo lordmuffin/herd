@@ -2,11 +2,62 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>herd</title>
+<meta name="description" content="herd's streams: what each agent is doing, and which one needs you">
+<meta name="theme-color" content="#1f6f5c" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#14231f" media="(prefers-color-scheme: dark)">
+<link rel="manifest" href="/static/manifest.webmanifest">
+<link rel="icon" href="/static/icons/icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
 </head>
 <body>
-<h1>herd</h1>
-<p>herd serve is running. The page comes in a later version; the API is at /api/snapshot.</p>
+<header class="top">
+  <div class="top-row">
+    <h1 class="title">herd<span id="host" class="host"></span></h1>
+    <span id="conn" class="conn" role="status" aria-live="polite"><span class="dot"></span><span id="conn-text">connecting</span></span>
+  </div>
+  <p id="counts" class="counts"></p>
+</header>
+
+<main>
+  <section id="pair" class="pair" hidden>
+    <h2>Pair this phone</h2>
+    <p>On the computer that runs herd, run</p>
+    <pre class="cmd">herd serve pair</pre>
+    <p>and open the link it prints on this phone (or scan its QR code). The link carries a token
+      that this page keeps, so you only do this once.</p>
+    <p id="pair-error" class="error" hidden></p>
+  </section>
+
+  <section id="overview" class="overview" hidden>
+    <p id="empty" class="empty" hidden>No streams right now. Start one with <code>herd</code> on the computer.</p>
+    <div id="repos"></div>
+  </section>
+
+  <section id="detail" class="detail" hidden>
+    <div class="detail-bar">
+      <button id="back" class="back" type="button" aria-label="Back to all streams">‹ All streams</button>
+    </div>
+    <div id="detail-head"></div>
+    <div class="tabs" role="tablist" aria-label="Stream detail">
+      <button type="button" role="tab" data-what="progress" aria-selected="true">Progress</button>
+      <button type="button" role="tab" data-what="diff" aria-selected="false">Diff</button>
+      <button type="button" role="tab" data-what="log" aria-selected="false">Log</button>
+      <button type="button" role="tab" data-what="screen" aria-selected="false">Screen</button>
+    </div>
+    <div class="tab-tools">
+      <span id="tab-note" class="tab-note"></span>
+      <button id="reload" type="button" class="reload">Reload</button>
+    </div>
+    <pre id="tab-text" class="text" role="tabpanel"></pre>
+  </section>
+</main>
+
+<footer class="foot">
+  <button id="forget" type="button" class="forget" hidden>Forget this device</button>
+</footer>
 </body>
 </html>

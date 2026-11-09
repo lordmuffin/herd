@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- herd's app icon: the source of icon-192.png and icon-512.png (rsvg-convert -w N). -->
+  <rect width="512" height="512" rx="96" fill="#1f6f5c"/>
+  <!-- three streams, the middle one ahead -->
+  <rect x="112" y="150" width="200" height="48" rx="24" fill="#e9f5f1"/>
+  <rect x="112" y="232" width="288" height="48" rx="24" fill="#e9f5f1"/>
+  <rect x="112" y="314" width="144" height="48" rx="24" fill="#e9f5f1"/>
+  <circle cx="368" cy="174" r="24" fill="#f2b632"/>
+</svg>
