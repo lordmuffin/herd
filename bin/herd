@@ -284,7 +284,9 @@ cmd_done() {
   local into=${base#origin/} pr status dirty
   for target in "$@"; do
     find_wt "$target" || continue
-    pr=$(pr_lookup "$into" "$branch"); case $? in
+    # `|| rc=$?`: under set -e a bare failing assignment would end the run before the case.
+    local rc=0; pr=$(pr_lookup "$into" "$branch") || rc=$?
+    case $rc in
       0) ;;
       1) echo "herd: $branch has no PR into $into — not removing (use herd rm to discard)" >&2; continue ;;
       *) echo "herd: can't check $branch's PR — not removing (use herd rm to discard)" >&2; continue ;;
