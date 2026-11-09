@@ -11,7 +11,7 @@ manifest=$root/herdr-plugin.toml
 # Run inside a herdr pane, these would reach the real herdr and its workspaces.
 unset HERDR_BIN_PATH HERDR_SOCKET_PATH HERDR_PLUGIN_ID HERDR_PLUGIN_CONTEXT_JSON HERDR_PLUGIN_EVENT_JSON \
   HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_PANE_ID HERDR_PLUGIN_CONFIG_DIR HERDR_PLUGIN_STATE_DIR HERD_REPO
-export HERD_NO_FZF=1 EDITOR=true VISUAL=true
+export HERD_NO_FZF=1 EDITOR=true VISUAL=true HERD_BACKEND=tui   # the terminal herdr, also when run in the Herdr app
 
 pass=0 fail=0
 ok() { pass=$((pass + 1)); echo "  ok   $1"; }
