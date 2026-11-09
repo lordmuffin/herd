@@ -1,0 +1,8 @@
+{
+  "global": {
+    "ctrl-shift-h": "layout.toggle:herd-panel",
+    "ctrl-alt-f": "herd.fanout",
+    "ctrl-alt-p": "herd.plan",
+    "ctrl-alt-d": "herd.draft"
+  }
+}

@@ -282,6 +282,73 @@ half a fan-out going.
 It then removes the worktree, closes the workspace, and deletes the local and remote branch.
 `-F` skips the checks.
 
+## Herdr desktop app
+
+herd also drives the [Herdr desktop app](https://herdr.dev) (`herdr-app`), whose terminals and
+agents run in herdr-core (`hc`). Every command above works there, and a `herd` mod adds a panel
+for it.
+
+**Which herdr.** herd picks the herdr to drive from the terminal it runs in:
+
+- a Herdr app terminal (one with `HC_TERMINAL_ID`) means the app;
+- a terminal-herdr pane or plugin means the terminal herdr;
+- anywhere else means the terminal herdr, as before.
+
+`HERD_BACKEND=desktop` or `HERD_BACKEND=tui` overrides this, and `herd backend` prints the
+choice.
+
+**What herd does in the app.** Each stream gets a space of its own:
+
+- herd runs `git worktree add`, then starts a kept shell in the checkout with `hc run`. The
+  shell's `herdr.space`/`herdr.tab` labels make the app show it as a new space, without taking
+  focus. Its other labels are `herd=1`, `herd.path` and `herd.branch`.
+- The agent is typed into that shell. The terminal is named after the agent, so
+  `hc read <agent>` and `hc send <agent> ...` work.
+- Prompts, waits, status and screen reads go through `hc send`, `wait`, `get` and `read`. That
+  covers `herd plan`'s gates and its check for background work too.
+- `herd rm` and `herd done` close the space and remove the worktree.
+
+Worktrees stay in herd's `~/git/wt/<repo>/<branch>`, so a stream started from the terminal herdr,
+the plugin or the app is the same stream to `herd status` and `herd done`. The app's spaces
+sidebar still nests these spaces under their repo, because it goes by git's common dir and not
+by path. Its *Open worktree* lists them too.
+
+If a new agent asks whether to trust its folder, herd waits up to 10 minutes for you to answer it
+in the agent's space (`HERD_ASK_WAIT` sets the seconds), then sends the task. The app has no
+equivalent of `-m` (other machines) or `-p` (parent workspace) yet. `-m` is refused, and `-p` is
+ignored.
+
+**The panel.** `desktop/mods/herd` is a mod for the app. It lists the focused repo's streams with
+their live agent status and plan stage, and a click on a row goes to that stream's space. Its
+buttons:
+
+- **Fan out** picks a `Tasks*.herd`, shows the dry run in the app's confirm dialog, then starts
+  the agents.
+- **Plan…** asks for a branch and a plan, and runs `herd plan` in a new tab, where its log stays
+  visible.
+- **Draft…** asks for a goal and writes a task file, then offers to fan it out.
+- **Done** on a row runs `herd done`, after a confirm.
+
+Results come back as toasts. A click on one shows the whole output. Install the mod from a
+checkout:
+
+```bash
+make desktop-install     # copies desktop/mods/herd to ~/.config/herdr-app/mods/herd, bundles this
+                         # checkout's bin/herd + personas in it, and runs herdr-app check
+```
+
+Then add the panel to your layout: a clone of `main`, since shipped layouts are read-only. Put it
+after the `panel` column in `work-body`:
+
+```json
+{ "id": "herd-panel", "type": "column", "size": { "px": 300 }, "min": 240, "max": 560,
+  "children": [{ "id": "herd", "type": "block", "content": { "mod": "herd" } }] }
+```
+
+`desktop/keys.json` has optional keys to merge into `~/.config/herdr-app/keys.json`: `ctrl-shift-h`
+toggles the panel, and `ctrl-alt-f`, `ctrl-alt-p` and `ctrl-alt-d` start a fan-out, a plan or a
+draft. `desktop/RECIPE.md` describes the mod in full, for rebuilding or sharing it.
+
 ## Requirements
 
 - [herdr](https://herdr.dev). The plugin needs herdr 0.9.5 or newer. The CLI runs from inside a
