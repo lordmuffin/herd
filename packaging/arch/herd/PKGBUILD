@@ -1,0 +1,29 @@
+# Maintainer: Andrew Jackson <dorkmeisterx69@gmail.com>
+# Tagged-release package. The release workflow fills in pkgver and sha256sums and attaches the
+# result to each GitHub Release as PKGBUILD, ready to copy into an AUR repo.
+pkgname=herd
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Fan out coding agents into git worktrees, one Herdr workspace each"
+arch=('any')
+url="https://github.com/lordmuffin/herd"
+license=('MIT')
+depends=('bash' 'git' 'jq' 'curl' 'util-linux')
+checkdepends=('shellcheck')
+optdepends=('github-cli: PR merge check in herd done for github.com repos'
+            'forgejo-cli: Forgejo login used by herd done to check PR merge state')
+conflicts=('herd-git')
+# herdr itself is not packaged; install it from https://herdr.dev (it lands in ~/.local/bin).
+source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')  # replaced by the release workflow; see SHA256SUMS on the release
+
+check() {
+  cd "$pkgname-$pkgver"
+  make test
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  make install DESTDIR="$pkgdir" PREFIX=/usr
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
