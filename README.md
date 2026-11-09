@@ -406,12 +406,17 @@ removes it again.
 
 ## Publishing (maintainer notes)
 
-The canonical repo is the private Forgejo; GitHub is a read-only mirror that builds releases.
-`.github/workflows/ci.yml` runs `make test` on every push and pull request. After the tests pass
-on a push to main, it reads `VERSION`, and if there is no `vX.Y.Z` release for it yet, it tags
-that commit, builds the source tarball, an Arch package and `SHA256SUMS`, and attaches them
-(plus a `PKGBUILD` with the checksum filled in) to a GitHub Release. Merges that leave
-`VERSION` alone ship nothing.
+The canonical repo is the private Forgejo; GitHub is a read-only mirror. Both run
+`.github/workflows/ci.yml`, which runs `make test` on every push and pull request.
+
+- **Forgejo cuts the release.** After the tests pass on a push to main, it reads `VERSION`. If
+  there is no `vX.Y.Z` release yet, it creates one at that commit, which also creates the tag.
+  The release gets the source tarball, `SHA256SUMS`, a `PKGBUILD` with the checksum filled in,
+  and the Arch package if the runner has docker (`packaging/release-assets.sh` builds them all).
+  Merges that leave `VERSION` alone ship nothing.
+- **GitHub mirrors it.** When the push mirror carries the tag over, GitHub builds the same
+  assets and publishes a matching GitHub Release. GitHub never creates tags itself, because the
+  push mirror would delete a GitHub-only tag again.
 
 One-time setup:
 
@@ -423,12 +428,12 @@ One-time setup:
      Contents: read and write. Enable "Sync when commits are pushed". Tags are mirrored too.
    - **Manual.** `git remote add github git@github.com:lordmuffin/herd.git`, then
      `make sync-github` pushes `main` and all tags.
-3. Releasing: bump `VERSION` in the PR (or in a commit on main) and merge. Once the mirror carries
-   main to GitHub, the workflow publishes `v<VERSION>`. No manual tag is needed; pushing a `v*`
-   tag yourself still works, and it must match `VERSION`. `make dist` builds the same tarball
-   locally into `dist/`. The tag CI creates exists only on GitHub; run
-   `git fetch github --tags && git push origin --tags` to bring it back to Forgejo. A push
-   mirror pushes with `--mirror` and can delete GitHub-only tags, so fetch them back first.
+3. Releasing: bump `VERSION` in the PR (or in a commit on main) and merge. Forgejo publishes
+   `v<VERSION>`; GitHub follows when the mirror next syncs. A tag created through the API may
+   wait for the mirror's interval, so press "Synchronize now" in the mirror settings to hurry it.
+   The release uses Forgejo's automatic Actions token. If your instance doesn't let that token
+   create releases, add a `FORGEJO_RELEASE_TOKEN` secret (a token with `write:repository`).
+   `packaging/release-assets.sh` builds the same files locally into `dist/`.
 4. For the AUR, copy the release's `PKGBUILD` into an AUR `herd` repo and run
    `makepkg --printsrcinfo > .SRCINFO`.
 5. For the [herdr plugin marketplace](https://herdr.dev/plugins/), add the `herdr-plugin` topic to
