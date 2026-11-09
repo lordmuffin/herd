@@ -135,11 +135,22 @@ action() {
     version)
       local v; v=$(run_herd --version)
       echo "$v"; notify "$v" "plugin $plugin_id at $root"; return ;;
-    menu | dashboard | fanout | draft | plan | plan-resume | status | "done" | rm | personas | settings) ;;
+    menu | dashboard | fanout | draft | plan | plan-resume | status | "done" | rm | personas | settings | serve) ;;
     *) echo "herd: unknown action '$1'" >&2; return 2 ;;
   esac
-  local repo; repo=$(resolve_repo) || repo=""
+  local repo v ws fwd=(); repo=$(resolve_repo) || repo=""
   if [[ $1 == dashboard && -n $repo ]]; then open_dashboard "$repo"; return; fi
+  # herd serve fills in the plan form on the phone: hand it to the pane, which then asks nothing,
+  # in a tab of the repo's own workspace (no pane is focused when the action comes from there).
+  if [[ $1 == plan || $1 == plan-resume ]]; then
+    for v in HERD_BRANCH HERD_PLAN_FILE HERD_PLAN_VERIFY HERD_PLAN_PERSONA; do
+      [[ -n ${!v:-} ]] && fwd+=("$v=${!v}")
+    done
+  fi
+  if ((${#fwd[@]})) && [[ -n $repo ]]; then
+    ws=$(repo_workspace "$repo")
+    open_pane "$1" "$repo" "${fwd[@]}" ${ws:+--workspace "$ws"}; return
+  fi
   open_pane "$1" "$repo"
 }
 
@@ -231,6 +242,7 @@ menu_items=(
   "status       Status of this repo's streams"
   "done         Done: clean up merged streams"
   "rm           Discard streams (no checks)"
+  "serve        Serve the web page for your phone (until its tab closes)"
   "personas     Personas"
   "settings     Settings"
   "version      Version"
@@ -244,7 +256,7 @@ pane_menu() {
     id=${choice%% *}
     case $id in
       # A plan runs for hours, so it gets its own tab instead of this overlay.
-      plan | plan-resume) open_pane "$id" "$repo"; return ;;
+      plan | plan-resume | serve) open_pane "$id" "$repo"; return ;;
       dashboard) if need_repo; then open_dashboard "$repo"; else pause; fi; return ;;
       version) run_herd --version; pause ;;
       *) "pane_${id//-/_}"; [[ $id == status ]] || pause ;;
@@ -323,6 +335,25 @@ pane_plan() {
   need_repo || return
   local branch src files=() f verify persona dry=() tmp="" rc
   echo "Run a plan: one worktree, one branch, a chain of gated stages, one PR at the end."; hr
+  # Filled in already (herd serve's plan form): run it as given, no questions.
+  if [[ -n ${HERD_BRANCH:-} && -n ${HERD_PLAN_FILE:-} ]]; then
+    branch=$HERD_BRANCH src=$HERD_PLAN_FILE verify=${HERD_PLAN_VERIFY:-}
+    persona=${HERD_PLAN_PERSONA:-${HERD_PERSONA:-engineer}}
+    echo "branch $branch, plan $src${verify:+, verify $verify}, persona $persona"
+    [[ -f $src ]] || { echo "herd: no plan file $src"; return 1; }
+  else
+    pane_plan_ask || return
+  fi
+  hr
+  run_herd plan -r "$repo" -b "$HERD_BASE" -k "$HERD_KIND" ${verify:+-v "$verify"} -P "$persona" "${dry[@]}" \
+    "$branch" "$src" ${agent_args[0]:+-- "${agent_args[@]}"}
+  rc=$?
+  [[ -n $tmp ]] && rm -f "$tmp"
+  plan_notify "$branch" "$rc"
+}
+
+# pane_plan's questions; sets its branch, src, tmp, verify, persona and dry.
+pane_plan_ask() {
   while :; do
     ask branch "branch (e.g. feat/export-csv)"
     [[ -n $branch ]] || return
@@ -342,12 +373,7 @@ pane_plan() {
   ask verify "default verify command for stages without one (empty: none)"
   ask persona "stage persona" "${HERD_PERSONA:-engineer}"
   confirm "stop after planning, to review the stages first?" n && dry=(-n)
-  hr
-  run_herd plan -r "$repo" -b "$HERD_BASE" -k "$HERD_KIND" ${verify:+-v "$verify"} -P "$persona" "${dry[@]}" \
-    "$branch" "$src" ${agent_args[0]:+-- "${agent_args[@]}"}
-  rc=$?
-  [[ -n $tmp ]] && rm -f "$tmp"
-  plan_notify "$branch" "$rc"
+  return 0
 }
 
 plan_notify() { # branch rc
@@ -421,6 +447,14 @@ pane_personas() {
   done
 }
 
+# herd serve in the foreground, so it stops when this tab closes. The pairing link goes first.
+pane_serve() {
+  echo "herd serve: the streams as a web page, for your phone. Close this tab to stop it."; hr
+  run_herd serve pair; hr
+  run_herd serve
+  echo "herd serve stopped."
+}
+
 pane_settings() {
   mkdir -p "$conf_dir"
   [[ -f $conf ]] || conf_template >"$conf"
@@ -436,7 +470,7 @@ pane() {
     menu) pane_menu ;;
     status) pane_status ;;
     dashboard) pane_dashboard ;;
-    fanout | draft | plan | plan-resume | "done" | rm | personas | settings) "pane_${1//-/_}"; pause ;;
+    fanout | draft | plan | plan-resume | "done" | rm | personas | settings | serve) "pane_${1//-/_}"; pause ;;
     *) echo "herd: unknown pane '$1'"; pause; return 2 ;;
   esac
 }
@@ -452,6 +486,14 @@ herd_wt() {
   echo "$HOME/git/wt/$r/$n"
 }
 
+# Tells a running herd serve to send a fresh snapshot now. Its state dir is herd's own (bin/herd
+# serve_state_dir), not this plugin's; it exists once herd serve has run.
+serve_nudge() {
+  local d=${HERD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herd}
+  [[ -d $d ]] && touch "$d/serve.nudge" 2>/dev/null
+  return 0
+}
+
 # A plan's state value $2 (stage, status) in worktree $1, or nothing.
 plan_state() { sed -n "s/^$2=//p" "$1/.herd/run/state" 2>/dev/null; }
 
@@ -460,7 +502,7 @@ event_hook() {
   local ev=${HERDR_PLUGIN_EVENT_JSON:-} pane st agents row cwd name wt prev key token pstatus
   # A worktree came or went: only open dashboards care.
   case ${HERDR_PLUGIN_EVENT:-} in
-    worktree.*) dash_tick; return 0 ;;
+    worktree.*) dash_tick; serve_nudge; return 0 ;;
   esac
   pane=$(jq -r '.data.pane_id // empty' <<<"$ev" 2>/dev/null)
   st=$(jq -r '.data.agent_status // empty' <<<"$ev" 2>/dev/null)
@@ -471,7 +513,7 @@ event_hook() {
   wt=$(herd_wt "$cwd") || return 0
   name=$(jq -r '.name // empty' <<<"$row"); name=${name:-$(basename "$wt")}
 
-  dash_tick
+  dash_tick; serve_nudge
   mkdir -p "$state_dir/panes"
   key=$state_dir/panes/${pane//[^A-Za-z0-9_-]/_}
   prev=$(cat "$key" 2>/dev/null); echo "$st" >"$key"

@@ -1,0 +1,214 @@
+# herd's JSON contract
+
+`herd status -j` and `herd show -j` are the machine-readable view of everything herd's web page
+shows. The page's server (`herd serve`) only ever runs these and passes their JSON on: it never
+parses herdr or git output itself, so bash stays the single source of truth. The herdr plugin's
+dashboard reads the same `herd status -j` objects.
+
+Fields are only ever added. Existing fields keep their names, types and order, so a caller that
+reads by position (the dashboard's old `@tsv` read did) keeps working.
+
+All three commands take `-b <ref>`, the base that `ahead`, `diff` and `log` are measured against
+(default `origin/main`; the plugin passes its `HERD_BASE`).
+
+## `herd status -j [-b ref] [-r repo]`
+
+One JSON object per line, one per stream of the repo. A stream is a linked worktree under
+`~/git/wt/<repo>/`, where `<repo>` is the name of the main checkout (also when `-r` names one of
+its worktrees). No streams prints nothing.
+
+```json
+{
+  "branch": "feat/a",
+  "agent": "feat-a",
+  "status": "working",
+  "plan": "stage 2/3 running",
+  "path": "/home/me/git/wt/proj/feat-a",
+  "workspace": "w5",
+  "pane_id": "w5:p1",
+  "host": "laptop",
+  "ahead": 2,
+  "dirty": 1,
+  "last_commit": { "sha": "4be1a2c", "subject": "fix: keep the next= param", "rel_time": "3 minutes ago" },
+  "plan_detail": {
+    "status": "running",
+    "stages": [
+      { "n": 1, "title": "Parse", "state": "done" },
+      { "n": 2, "title": "Writer", "state": "current" },
+      { "n": 3, "title": "Docs", "state": "todo" }
+    ],
+    "stopped_reason": null
+  }
+}
+```
+
+| field | type | meaning |
+| --- | --- | --- |
+| `branch` | string | the worktree's branch (`-` if detached) |
+| `agent` | string | the agent name herd gives the branch (`fix/foo` -> `fix-foo`) |
+| `status` | string | the agent's `agent_status` from `herdr agent list` (`working`, `blocked`, `idle`, `done`, `unknown`), or `-` with no agent in the worktree |
+| `plan` | string | the plan's place as one label (`stage 2/3 running`, `complete`, `planning`), or `""` with no plan |
+| `path` | string | the worktree |
+| `workspace` | string | its open herdr workspace id, or `-` |
+| `pane_id` | string\|null | the agent's herdr pane (`pane_id` in `herdr agent list`), or null with no agent |
+| `host` | string | this machine as the Herdr Mobile Relay knows it: `HERD_RELAY_HOST`, else `hostname -s`. herdr's agent list has no host field |
+| `ahead` | number\|null | commits on the branch not in the base; null if the base is unknown or the worktree is gone |
+| `dirty` | number\|null | uncommitted files, untracked ones included (`git status --porcelain` lines); null if the worktree is gone |
+| `last_commit` | object\|null | `{sha (short), subject, rel_time ("3 minutes ago")}` of HEAD |
+| `plan_detail` | object\|null | the plan run, from `.herd/run/`; null when the stream has no plan run (no `.herd/run/state`) |
+
+An agent counts as the stream's when its `cwd` is the worktree or a directory under it.
+
+`plan` was already a string label before `plan_detail` existed, and stays one so existing callers
+don't break; the structured plan is `plan_detail`:
+
+| field | type | meaning |
+| --- | --- | --- |
+| `status` | string\|null | the plan's status from `.herd/run/state`: `planning`, `replanning`, `pending`, `running`, `fixing`, `verified`, `blocked`, `failed`, `complete` |
+| `stages` | array | one `{n, title, state}` per `## Stage N: title` in `.herd/run/stages.md`; empty while the planner is still writing them |
+| `stages[].state` | string | `done`, `current`, `stopped` or `todo` (below) |
+| `stopped_reason` | string\|null | why the plan is stopped: the text after a `STOPPED:` line in `PROGRESS.md`, else a sentence starting `blocked:` or `failed:`; null while it isn't stopped |
+
+A stage is `done` if it comes before the current one, or is the current one and `verified`, or
+the plan is `complete`. The current stage is `stopped` if the plan is `blocked` or `failed` or
+`PROGRESS.md` has a `STOPPED:` line, and `current` otherwise. Later stages are `todo`.
+
+## `herd status -j -a [-b ref]`
+
+Every repo with streams, as one JSON document. It looks at every directory `~/git/wt/*/*`, maps
+each git worktree there back to its main checkout (`git rev-parse --git-common-dir`), and lists
+each checkout's streams as `herd status -j` would. Directories that aren't worktrees are skipped,
+and so are checkouts with no streams. Runs from anywhere; `-r` is ignored.
+
+```json
+{
+  "generated_at": "2026-11-09T21:26:24Z",
+  "host": "laptop",
+  "repos": [
+    { "repo": "proj", "path": "/home/me/git/proj", "streams": [ { "branch": "feat/b", "status": "blocked", "...": "..." } ] }
+  ]
+}
+```
+
+| field | type | meaning |
+| --- | --- | --- |
+| `generated_at` | string | UTC, `YYYY-MM-DDTHH:MM:SSZ` |
+| `host` | string | as in a stream |
+| `repos` | array | sorted by path; `[]` when there are no streams anywhere |
+| `repos[].repo` | string | the main checkout's directory name |
+| `repos[].path` | string | the main checkout |
+| `repos[].streams` | array | `herd status -j` objects, blocked ones first, otherwise in herdr's worktree order |
+
+Without `-j`, `-a` prints each repo's `herd status` table under a `== repo (path)` line.
+
+## `herd show -j [-b ref] <repo-path> <branch> <what>`
+
+One stream's text. `<repo-path>` is the main checkout or any of its worktrees; `<branch>` must be
+one of its streams (as `herd status` lists them), or `herd show` exits 1 with `herd: <branch> is
+not a herd stream of <repo>` on stderr. A bad `<what>`, repo or argument count also exits non-zero
+with a message on stderr, and prints no JSON.
+
+| `<what>` | text |
+| --- | --- |
+| `diff` | `git diff <base>` in the worktree: committed and uncommitted changes to tracked files (untracked files are not in it; `dirty` counts them) |
+| `log` | `git log --oneline <base>..HEAD` |
+| `progress` | `.herd/run/PROGRESS.md`, or `""` without one |
+| `screen` | `herdr agent read <pane_id> --source recent-unwrapped --lines 200` of the stream's agent, or `""` with no agent |
+
+```json
+{ "text": "diff --git a/x b/x\n...", "truncated": false }
+```
+
+`text` stops at 200 KB (204800 bytes); `truncated` is true when it was cut. A cut can land inside
+a multi-byte character, which then shows as U+FFFD. Without `-j`, `herd show` prints the (capped)
+text itself.
+
+## `herd serve`: the HTTP routes
+
+`herd serve [--listen ADDR] [--port N] [--read-only]` runs `serve/herd_serve.py` (Python 3, stdlib
+only; herd itself doesn't need Python). It binds `127.0.0.1:8380` by default (8375 and 8376 are the
+relay's). herd.conf's `HERD_SERVE_LISTEN`, `HERD_SERVE_PORT`, `HERD_SERVE_READ_ONLY=1` and
+`HERD_SERVE_HOSTS` set the same; flags win. It passes herd.conf's `HERD_BASE` as `-b` to every
+command below and exports `HERD_RELAY_HOST`. The write routes also take `HERD_KIND` (`-k`),
+`HERD_AGENT_ARGS` (after `--`) and `HERD_SERVE_REPOS`: repos to offer and allow besides those
+with streams (space or comma separated).
+
+| route | auth | answer |
+| --- | --- | --- |
+| `GET /`, `GET /static/<file>` | none | `web/index.html`, `web/<file>` |
+| `GET /sw.js` | none | `web/sw.js`, the page's service worker, at the root so its scope is the whole page |
+| `GET /healthz` | none | `ok` |
+| `GET /api/snapshot` | token | `herd status -j -a`, reused for 2 s (or until the nudge file changes) |
+| `GET /api/show?repo=&branch=&what=` | token | `herd show -j`; 404 unless `repo` is a `repos[].path` of the snapshot and `branch` one of its streams, 400 for a bad `what` |
+| `GET /api/events` | token, or `?t=<token>` | Server-Sent Events, below |
+| `GET /api/config` | token | `{relay_app_url, relay_host, read_only, repos, role}`: herd.conf's `HERD_RELAY_APP_URL` (null when unset) and `HERD_RELAY_HOST` (else `hostname -s`), for the page's Herdr Mobile links; whether the server is `--read-only`; `HERD_SERVE_REPOS` as real paths; and `reader` or `controller` for the token sent. Never a token |
+| `GET /api/personas[?repo=]` | token | `{personas: [{name, description}]}` from `herd personas -j`, run in the repo (so its `.herd/personas` count); 404 for a repo it doesn't know |
+
+A failing herd command is a 502 with `{error}`; every /api answer is `Cache-Control: no-store`.
+
+**Events.** `/api/events` sends `event: snapshot` with the snapshot as `data` at once, then again
+whenever it changes. It checks every 5 s, and at once when `<state dir>/serve.nudge` changes its
+mtime: the herdr plugin's event hook touches that file on every agent status change of a herd
+stream and every worktree event. A `: keep-alive` comment goes out every 20 s without a change. A
+failing check sends `event: error` with `{error}` and the stream carries on.
+
+**Auth.** The state dir is `$HERD_STATE_DIR`, else `${XDG_STATE_HOME:-~/.local/state}/herd`. The
+first start on loopback writes `serve-tokens.json` there (mode 0600) with a `reader` and a
+`controller` token. Every /api route wants `Authorization: Bearer <token>` (401 without);
+`/api/events` also takes `?t=`, since EventSource can't set headers, and the server never logs a
+query string. Both tokens can read; only the controller can write. The server reads the file
+again whenever it changes, so `herd serve revoke [--reader|--controller]` (a new token; both
+without a flag) signs out every device holding the old one at once. `herd serve pair [--reader]`
+prints `http://<address>:<port>/#t=<token>` for the listen address (not a wildcard) and each
+`HERD_SERVE_HOSTS` name, with a `qrencode -t ansiutf8` QR code for the non-loopback ones.
+
+**Lifetime.** SIGTERM and SIGHUP (the plugin's `serve` tab closing) stop it cleanly. `herd serve
+install` writes a systemd user unit (`~/.config/systemd/user/herd-serve.service`) or a launchd
+agent (`~/Library/LaunchAgents/lordmuffin.herd-serve.plist`) that runs `herd serve --listen
+<HERD_SERVE_LISTEN> --port <HERD_SERVE_PORT> [--read-only]` with `HERD_CONF` and the installing
+shell's `PATH`, and starts it; `herd serve uninstall` stops and removes it.
+
+**Host check.** A request whose `Host` is not the bound address, `localhost` or a
+`HERD_SERVE_HOSTS` entry (space or comma separated) is a 403, `/healthz` included. This stops DNS
+rebinding.
+
+**The page.** `web/` holds `index.html`, `app.js`, `app.css`, `manifest.webmanifest`, `sw.js` and
+`icons/` (PNGs made from `icons/icon.svg` with `rsvg-convert -w N`). No build step and no URL but
+this server's. A device pairs by opening the page with `#t=<token>`: the page keeps the token in
+localStorage, drops the fragment from the address bar, and sends the token as a bearer header
+(and as `?t=` to `/api/events`). Every stream links to the Herdr Mobile app with the relay's deep
+link, `<relay_app_url>#notify=<encodeURIComponent(JSON.stringify({pane_id, host}))>`, using the
+stream's `pane_id` and `host`. The service worker caches the shell only, never an /api answer.
+
+**Writes.** The POST routes below need the controller token: a reader token is a 403, no token a
+401, and `--read-only` makes every one a 405, controller or not. The body is a JSON object
+(`Content-Type: application/json`, at most 64 KB: 413 over, 415 for another type). Every answer
+is `{ok, output, error, request_id}` plus the route's own fields, with the request id also in
+`X-Request-Id`. A check that fails before herd runs is a 4xx with `ok: false`; once herd ran, the
+answer is a 200 whose `ok` is herd's exit status and whose `output` is its stdout and stderr; herd
+not running at all (or past its time) is a 502. `repo` must be a repo of the snapshot or of
+`HERD_SERVE_REPOS` (else 404). herd always runs with an argv, never a shell.
+
+| route | body | runs |
+| --- | --- | --- |
+| `POST /api/start` | `{repo, branch, persona, prompt}` | `herd -r <repo> -b <base> -k <kind> [-P <persona>] <branch> <prompt> [-- <agent args>]`. The branch is checked like `herd draft` checks a task line: `git check-ref-format --branch`, no whitespace, `@` or `:`, no leading `-`, not an existing local or `origin/` branch (409), a non-empty agent name. The persona is `""` (herd's default), `none`, or a name from `herd personas` |
+| `POST /api/draft` | `{repo, goal, output}` | `herd draft -r <repo> -b <base> -o <repo>/<output> -`, the goal on stdin (as an argument, a goal that names a file would be read). `output` must match `Tasks*.herd`, be a plain name in the repo root (no `/`, no symlink out) and not exist yet (409); empty picks `Tasks.herd`, else `Tasks-<date>.herd`. Answers also `file`, `text` (the saved file), `dry_run` (`herd -n -f`) and `hash` (as for a fan-out preview) |
+| `POST /api/fanout[?dry=1]` | `{repo, file, hash}` | With `?dry=1` (or `"dry": true`): `herd -n -r <repo> -f <file>`, answering `hash`. Without: `herd -r <repo> -b <base> -k <kind> -f <file> [-- <agent args>]`, only if `hash` is one a preview (or a draft) gave in the last 15 minutes and still matches the file (sha256 of repo, name and bytes): else 409, so a stale preview can't start a different batch. A hash starts one batch only. `file` must match `*.herd` in the repo root |
+| `POST /api/plan` | `{repo, branch, plan_text, verify, persona}` | Writes `plan_text` to `<repo>/.herd/inbox/<branch>.md` (added to the repo's `info/exclude`), then runs the herdr plugin's `plan` action with `HERD_REPO`, `HERD_BRANCH`, `HERD_PLAN_FILE`, `HERD_PLAN_VERIFY` and `HERD_PLAN_PERSONA` set. The action opens the `plan` pane in a herdr tab of the repo's workspace, which runs `herd plan` with them and asks nothing, so the driver lives in herdr, not in the server. The branch is checked as for start. 501 when herd serve finds no plugin next to herd |
+| `POST /api/plan-resume` | `{repo, branch}` | The plugin's `plan-resume` action with `HERD_BRANCH`, the same way; 409 unless the stream has a plan |
+| `POST /api/done` | `{repo, branches: []}` | `herd done -r <repo> -b <base> <branches>`, with its usual checks; each branch must be a stream of the snapshot (404) |
+| `POST /api/rm` | `{repo, branches: [], confirm: "discard"}` | `herd rm -r <repo> <branches>`; 400 without `confirm: "discard"` |
+
+Every POST to one of these routes (refused or not) adds one line to `<state dir>/serve-audit.jsonl`
+(mode 0600): `{ts, request_id, token_role, route, repo, branch, ok, status}`, plus `file` for
+draft and fanout. `branch` is a list for done and rm. A prompt, goal or plan is never logged: only
+`prompt_len`/`prompt_sha256`, `goal_len`/`goal_sha256` or `plan_len`/`plan_sha256`.
+
+The page's **New** button (controller only) opens a sheet with three tabs: Task (repo, prompt,
+branch suggested from the prompt, persona), Draft (repo, goal; then the drafted lines and Fan
+out, which sends the draft's hash) and Plan (repo, branch, plan, verify, persona). It keeps the
+last repo and persona and the last 10 prompts in localStorage. The detail view gets Resume plan,
+Done and Discard (which wants `discard` typed in). Results show inline.
+
+**Off loopback.** A non-loopback address needs `--listen` on the command line (one from herd.conf
+alone is refused) and the tokens file to exist already (start once on loopback to make it).

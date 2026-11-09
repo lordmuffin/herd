@@ -10,7 +10,8 @@ plugin=$root/plugin/herd-plugin.sh
 manifest=$root/herdr-plugin.toml
 # Run inside a herdr pane, these would reach the real herdr and its workspaces.
 unset HERDR_BIN_PATH HERDR_SOCKET_PATH HERDR_PLUGIN_ID HERDR_PLUGIN_CONTEXT_JSON HERDR_PLUGIN_EVENT_JSON \
-  HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_PANE_ID HERDR_PLUGIN_CONFIG_DIR HERDR_PLUGIN_STATE_DIR HERD_REPO
+  HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_PANE_ID HERDR_PLUGIN_CONFIG_DIR HERDR_PLUGIN_STATE_DIR HERD_REPO \
+  XDG_STATE_HOME HERD_STATE_DIR
 export HERD_NO_FZF=1 EDITOR=true VISUAL=true HERD_BACKEND=tui   # the terminal herdr, also when run in the Herdr app
 
 pass=0 fail=0
@@ -194,6 +195,17 @@ check "runs herd plan with the picked plan and the engineer default" out_has "fe
 check "notifies when the plan run ends" called "notification show herd: plan feat/p ended"
 setup; pane plan $'not a branch\n'
 check "refuses a bad branch name" out_has "not a valid branch name"
+setup
+(cd "$root" && HERD_REPO=$repo HERD_BRANCH=feat/q HERD_PLAN_FILE=$repo/PLAN.md HERD_PLAN_PERSONA=engineer \
+  bash "$plugin" pane plan <<<"") >"$T/out" 2>&1
+check "a filled-in plan form (from herd serve) runs herd plan without asking" \
+  bash -c "grep -qF 'branch feat/q, plan $repo/PLAN.md, persona engineer' '$T/out' && ! grep -q 'branch (e.g.' '$T/out'"
+check "...for real: the plan's worktree and agent start" \
+  bash -c "grep -qF 'worktree create --cwd $repo --branch feat/q' '$T/calls' && grep -qF 'agent start feat-q' '$T/calls'"
+: >"$T/calls"
+(HERD_REPO=$repo HERD_BRANCH=feat/q HERD_PLAN_FILE=$repo/PLAN.md HERD_PLAN_VERIFY="make test" bash "$plugin" action plan) >"$T/out" 2>&1
+check "the plan action hands a filled-in form to its pane, in the repo's workspace" \
+  called "--env HERD_REPO=$repo --env HERD_BRANCH=feat/q --env HERD_PLAN_FILE=$repo/PLAN.md --env HERD_PLAN_VERIFY=make test --workspace w1"
 setup; pane plan-resume ""
 check "no plan state, nothing to resume" out_has "no stopped plans"
 mkdir -p "$wt/.herd/run"; printf 'stage=1\nstatus=blocked\n' >"$wt/.herd/run/state"
@@ -216,6 +228,24 @@ check "Tasks.herd exists, so it writes a dated file" test -n "$f"
 check "the file has the dispatcher's task" grep -qx 'feat/x @engineer: Do x and open a PR.' "${f:-/dev/null}"
 setup; rm "$repo/Tasks.herd"; pane draft $'Add x\n\nn\n'
 check "with no Tasks.herd it writes Tasks.herd" test -f "$repo/Tasks.herd"
+
+echo "pane serve"
+if command -v python3 >/dev/null; then
+  setup
+  port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+  printf 'HERD_BASE=main\nHERD_SERVE_PORT=%s\n' "$port" >"$T/conf/herd.conf"
+  # A closing tab hangs up the pane's whole process group; setsid gives this run one of its own.
+  (cd "$root" && HERD_REPO=$repo HERD_STATE_DIR=$T/st exec setsid bash "$plugin" pane serve </dev/null) >"$T/out" 2>&1 &
+  spid=$!
+  for ((i = 0; i < 50; i++)); do grep -q 'listening on' "$T/out" 2>/dev/null && break; sleep 0.1; done
+  kill -HUP -- "-$spid" 2>/dev/null; wait "$spid" 2>/dev/null; sleep 0.3
+  check "shows the pairing link first, with the controller token" \
+    bash -c "grep -qF 'http://127.0.0.1:$port/#t='\"\$(jq -r .controller '$T/st/serve-tokens.json')\" '$T/out'"
+  check "...then runs herd serve in the foreground" bash -c "grep -qF 'listening on http://127.0.0.1:$port/' '$T/out'"
+  check "...until the tab goes (SIGHUP)" bash -c "! pgrep -f '[h]erd_serve.py.*$T/st' >/dev/null"
+else
+  echo "  skip: no python3"
+fi
 
 echo "pane personas / settings / menu"
 setup; pane personas ""
@@ -333,6 +363,13 @@ check "a worktree event touches the dashboards' tick" test -f "$T/state/tick"
 check "...and does nothing else" test ! -s "$T/calls"
 rm -f "$T/state/tick"; event w5:p1 idle
 check "an agent status change of a herd stream touches it too" test -f "$T/state/tick"
+# herd serve's nudge is in herd's own state dir, and only once herd serve has made that dir.
+check "...but makes no herd serve state dir" test ! -e "$T/.local/state/herd"
+mkdir -p "$T/.local/state/herd"; event w5:p1 working
+check "with herd serve's state dir, a status change touches serve.nudge" test -f "$T/.local/state/herd/serve.nudge"
+rm -f "$T/.local/state/herd/serve.nudge"
+(HERDR_PLUGIN_EVENT=worktree.removed bash "$plugin" event) >"$T/out" 2>&1
+check "...and so does a worktree event" test -f "$T/.local/state/herd/serve.nudge"
 # The loop reloads when the tick is newer than its last load: a pane reading slowly from a pipe
 # sees the hook fire between two keys.
 { sleep 1.2; HERDR_PLUGIN_EVENT=worktree.removed bash "$plugin" event >/dev/null 2>&1; sleep 1.5; echo q; } |

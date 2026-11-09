@@ -1,0 +1,15 @@
+{
+  "name": "herd",
+  "short_name": "herd",
+  "description": "herd's streams: what each agent is doing, and which one needs you",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "theme_color": "#1f6f5c",
+  "background_color": "#f6f7f6",
+  "icons": [
+    { "src": "/static/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/static/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}

@@ -8,10 +8,11 @@ url="https://github.com/lordmuffin/herd"
 license=('MIT')
 depends=('bash' 'git' 'jq' 'curl' 'util-linux')
 makedepends=('git')
-checkdepends=('shellcheck')
+checkdepends=('shellcheck' 'python')
 optdepends=('github-cli: PR merge check in herd done for github.com repos'
             'fzf: pickers in the herdr plugin'
-            'forgejo-cli: Forgejo login used by herd done to check PR merge state')
+            'forgejo-cli: Forgejo login used by herd done to check PR merge state'
+            'python: herd serve, the web page and its API')
 provides=('herd')
 conflicts=('herd')
 # Public GitHub mirror; the canonical (private) repo is on Forgejo. herdr itself is not packaged;

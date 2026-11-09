@@ -24,12 +24,27 @@
 #                                     # per parallel task; herd checks every line before it saves
 #                                     # Tasks.herd (or -o file, "-" for stdout; -F overwrites)
 #   herd ls                           # agents + their status
-#   herd status [-j] [-r repo]        # this repo's streams: branch, agent, status, plan stage
-#                                     # (-j: one JSON object per stream)
+#   herd status [-j] [-a] [-b ref] [-r repo]
+#                                     # this repo's streams: branch, agent, status, plan stage
+#                                     # (-j: one JSON object per stream, with git facts and plan
+#                                     # stages; -a: every repo with streams under ~/git/wt, as one
+#                                     # JSON document with -j; see docs/serve-api.md)
+#   herd show [-j] [-b ref] <repo> <branch> diff|progress|screen|log
+#                                     # one stream's diff or log against the base, its
+#                                     # PROGRESS.md or its agent's screen (-j: {text, truncated})
+#   herd serve [--listen ADDR] [--port N] [--read-only]
+#                                     # serve the streams as a web page and JSON API on
+#                                     # 127.0.0.1:8380 (needs python3; herd.conf HERD_SERVE_*
+#                                     # set the same; see docs/serve-api.md)
+#   herd serve pair [--reader]        # print the page's pairing link (and a QR code)
+#   herd serve revoke [--reader|--controller]
+#                                     # rotate a token: signs out every device holding it
+#   herd serve install | uninstall    # run herd serve as a systemd user unit / launchd agent
 #   herd version                      # print the version (also --version, -V)
 #   herd backend                      # which herdr this drives: tui (the terminal herdr) or desktop
 #                                     # (the Herdr app, through hc); HERD_BACKEND=desktop|tui picks
-#   herd personas [<name>]            # list personas, or print one as a ready-to-paste prompt
+#   herd personas [-j] [<name>]       # list personas (-j: as JSON), or print one as a
+#                                     # ready-to-paste prompt
 #   herd rm [-f file] <branch|name>...        # remove worktree, workspace and local branch
 #   herd done [-F] [-f file] <branch|name>... # after merge: check PR merged + agent idle + tree
 #                                     # clean, then rm and delete the remote branch (-F skips checks)
@@ -105,8 +120,9 @@ cmd_version() {
   for f in "$d/../VERSION" "$d/../share/herd/VERSION"; do
     [[ -f $f ]] || continue
     v=$(head -n1 "$f")
-    # In a git checkout, say which commit this is, e.g. 0.1.0-3-gabc1234.
-    [[ $f == "$d/../VERSION" ]] && v=$(git -C "$d" describe --tags --match 'v*' --dirty 2>/dev/null || echo "$v")
+    # In a git checkout, say which commit this is, e.g. 0.1.0-3-gabc1234. Only against this
+    # VERSION's own tag: before a bumped VERSION is tagged, the plain VERSION is the truth.
+    [[ $f == "$d/../VERSION" ]] && v=$(git -C "$d" describe --tags --match "v$v" --dirty 2>/dev/null || echo "$v")
     echo "herd ${v#v}"; return
   done
   echo "herd unknown"
@@ -190,7 +206,11 @@ cmd_personas() {
         desc=$(sed -n 's/^> //p' "$f" | head -1)
         printf '%s\t%s\t%s\n' "$n" "${desc:--}" "$f"
       done
-    done < <(persona_dirs); } | awk -F'\t' '!seen[$1]++' | column -t -s $'\t'
+    done < <(persona_dirs); } | awk -F'\t' '!seen[$1]++' |
+    if ((json)); then
+      jq -R -s -c '[split("\n")[] | select(length > 0) | split("\t")
+                    | {name: .[0], description: (if .[1] == "-" then null else .[1] end), path: .[2]}]'
+    else column -t -s $'\t'; fi
 }
 
 # Prints the repo root's Tasks.herd if there is one, and says so on stderr. With -m, -r is a path
@@ -767,33 +787,167 @@ plan_label() {
   if [[ ${s:-0} == 0 ]]; then echo "$st"; else echo "stage $s/$n $st"; fi
 }
 
-# herd's streams in $repo — the linked worktrees under ~/git/wt/<repo>/ — with each one's agent,
-# its status and, for a plan, where it is. -j prints one JSON object per stream instead.
-cmd_status() {
-  [[ -n $repo ]] || repo=$(git rev-parse --show-toplevel)
-  local wts agents path branch ws name st plan rows="" main
-  # Streams are named after the main checkout, also when this runs in one of its worktrees.
-  main=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir) || die "$repo is not a git repo"
-  [[ $(basename "$main") == .git ]] && main=$(dirname "$main")
-  wts=$(h worktree list --cwd "$repo") || die "could not list worktrees of $repo"
-  agents=$(h agent list 2>/dev/null) || agents='{"result":{"agents":[]}}'
-  while IFS=$'\t' read -r path branch ws; do
-    name=$(agent_name "$branch")
-    st=$(jq -r --arg p "$path" '[.result.agents[] | select(.cwd == $p or (.cwd | startswith($p + "/")))
-           | .agent_status][0] // "-"' <<<"$agents")
-    plan=$(plan_label "$path")
-    if ((json)); then
-      jq -cn --arg b "$branch" --arg a "$name" --arg s "$st" --arg pl "$plan" --arg p "$path" --arg w "$ws" \
-        '{branch: $b, agent: $a, status: $s, plan: $pl, path: $p, workspace: $w}'
-    else
-      rows+=$(printf '%s\t%s\t%s\t%s\t%s' "$branch" "$name" "$st" "${plan:--}" "$ws")$'\n'
+# A plan's stages and where it stopped, from <worktree>/.herd/run, as JSON: {status, stages: [{n,
+# title, state}], stopped_reason}, state being done, current, stopped (blocked, failed, or a
+# "STOPPED:" line in PROGRESS.md) or todo. null when the stream has no plan run.
+plan_json() {
+  local r=$1/.herd/run s="" st="" titles="" stop=""
+  [[ -f $r/state ]] || { echo null; return; }
+  s=$(sed -n 's/^stage=//p' "$r/state") st=$(sed -n 's/^status=//p' "$r/state")
+  [[ -f $r/stages.md ]] && titles=$(sed -n 's/^## Stage [0-9][0-9]*:\{0,1\}[[:space:]]*//p' "$r/stages.md")
+  stop=$(grep -m1 '^STOPPED:' "$r/PROGRESS.md" 2>/dev/null) && stop=$(sed 's/^STOPPED:[[:space:]]*//' <<<"$stop")
+  jq -cn --arg s "$s" --arg st "$st" --arg t "$titles" --arg stop "$stop" '
+    ($s | tonumber? // 0) as $cur
+    | {status: (if $st == "" then null else $st end),
+       stages: [$t | if . == "" then [] else split("\n") end | to_entries[] | (.key + 1) as $n
+         | {n: $n, title: .value,
+            state: (if $st == "complete" or $n < $cur then "done"
+                    elif $n == $cur then
+                      (if $st == "verified" then "done"
+                       elif $st == "blocked" or $st == "failed" or $stop != "" then "stopped"
+                       else "current" end)
+                    else "todo" end)}],
+       stopped_reason: (if $stop != "" then $stop
+                        elif $st == "blocked" then "blocked: the agent is waiting for an answer in its pane"
+                        elif $st == "failed" then "failed: the stage still fails its gate after a fix-up turn"
+                        else null end)}'
+}
+
+# git facts for a worktree, as JSON: {ahead (commits ahead of $base), dirty (uncommitted files),
+# last_commit: {sha, subject, rel_time}}. Each is null where git can't say (worktree gone, base
+# unknown, no commits).
+stream_git_json() {
+  local p=$1 ahead="" dirty="" s last=""
+  if [[ -d $p ]]; then
+    ahead=$(git -C "$p" rev-list --count "$base..HEAD" 2>/dev/null) || ahead=""
+    if s=$(git -C "$p" status --porcelain 2>/dev/null); then
+      dirty=0; [[ -z $s ]] || dirty=$(($(wc -l <<<"$s")))
     fi
-  done < <(jq -r --arg pre "$HOME/git/wt/$(basename "$main")/" '.result.worktrees[]
-             | select(.is_linked_worktree and (.path | startswith($pre)))
-             | [.path, .branch // "-", .open_workspace_id // "-"] | @tsv' <<<"$wts")
+    last=$(git -C "$p" log -1 --format='%h%x09%cr%x09%s' 2>/dev/null) || last=""
+  fi
+  jq -cn --arg a "$ahead" --arg d "$dirty" --arg l "$last" '
+    {ahead: ($a | tonumber? // null), dirty: ($d | tonumber? // null),
+     last_commit: (if $l == "" then null
+                   else $l | split("\t") | {sha: .[0], subject: (.[2:] | join("\t")), rel_time: .[1]} end)}'
+}
+
+# The host name the web page shows and the relay deep link carries: HERD_RELAY_HOST, else hostname -s.
+herd_host() { echo "${HERD_RELAY_HOST:-$(hostname -s 2>/dev/null || uname -n)}"; }
+
+# Sets main (the main checkout of $repo) and stream_tsv: herd's streams in it, the linked
+# worktrees under ~/git/wt/<repo>/, one "path\tbranch\tworkspace" line each. Fails with a message.
+load_streams() {
+  local wts
+  stream_tsv=""
+  # Streams are named after the main checkout, also when this runs in one of its worktrees.
+  main=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+    || { echo "herd: $repo is not a git repo" >&2; return 1; }
+  [[ $(basename "$main") == .git ]] && main=$(dirname "$main")
+  wts=$(h worktree list --cwd "$repo") || { echo "herd: could not list worktrees of $repo" >&2; return 1; }
+  stream_tsv=$(jq -r --arg pre "$HOME/git/wt/$(basename "$main")/" '.result.worktrees[]
+                 | select(.is_linked_worktree and (.path | startswith($pre)))
+                 | [.path, .branch // "-", .open_workspace_id // "-"] | @tsv' <<<"$wts")
+}
+
+# `h agent list`, once per run; an unreachable herdr counts as no agents.
+load_agents() {
+  [[ -n ${agents:-} ]] || agents=$(h agent list 2>/dev/null) || agents='{"result":{"agents":[]}}'
+}
+
+# The agent running in worktree $1 (or a directory under it), as agent-list JSON, or null.
+stream_agent() {
+  jq -c --arg p "$1" '[.result.agents[] | select(.cwd == $p or (.cwd | startswith($p + "/")))][0] // null' <<<"$agents"
+}
+
+# One stream as a JSON object. The first six fields are the original `status -j` ones, in their
+# original order; docs/serve-api.md has the whole contract.
+stream_json() {
+  local path=$1 branch=$2 ws=$3
+  jq -cn --arg b "$branch" --arg a "$(agent_name "$branch")" --arg pl "$(plan_label "$path")" \
+    --arg p "$path" --arg w "$ws" --arg host "$host" --argjson ag "$(stream_agent "$path")" \
+    --argjson git "$(stream_git_json "$path")" --argjson pd "$(plan_json "$path")" '
+    {branch: $b, agent: $a, status: ($ag.agent_status // "-"), plan: $pl, path: $p, workspace: $w,
+     pane_id: ($ag.pane_id // null), host: $host} + $git + {plan_detail: $pd}'
+}
+
+# herd's streams in $repo, with each one's agent, its status and, for a plan, where it is. -j
+# prints one JSON object per stream instead.
+cmd_status() { load_streams || exit 1; print_streams; }
+
+# cmd_status for the streams load_streams found.
+print_streams() {
+  local path branch ws st pl rows="" host
+  load_agents
+  host=$(herd_host)
+  while IFS=$'\t' read -r path branch ws; do
+    [[ -n $path ]] || continue
+    if ((json)); then stream_json "$path" "$branch" "$ws"; continue; fi
+    st=$(stream_agent "$path" | jq -r '.agent_status // "-"')
+    pl=$(plan_label "$path")
+    rows+=$(printf '%s\t%s\t%s\t%s\t%s' "$branch" "$(agent_name "$branch")" "$st" "${pl:--}" "$ws")$'\n'
+  done <<<"$stream_tsv"
   ((json)) && return
   if [[ -z $rows ]]; then echo "no herd streams in $repo"; return; fi
   { printf 'BRANCH\tAGENT\tSTATUS\tPLAN\tWORKSPACE\n'; printf '%s' "$rows"; } | column -t -s $'\t'
+}
+
+# Every main checkout with streams under ~/git/wt/<repo>/, found by mapping each worktree there
+# back to its checkout. -j prints one document: {generated_at, host, repos: [{repo, path,
+# streams}]}, blocked streams first in each repo.
+cmd_status_all() {
+  local d common m host out mains=()
+  for d in "$HOME"/git/wt/*/*/; do
+    common=$(git -C "$d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || continue
+    [[ $(basename "$common") == .git ]] && common=$(dirname "$common")
+    mains+=("$common")
+  done
+  load_agents
+  host=$(herd_host)
+  while IFS= read -r m; do
+    [[ -n $m ]] || continue
+    repo=$m
+    load_streams || continue
+    [[ -n $stream_tsv ]] || continue
+    if ! ((json)); then echo "== $(basename "$m")  ($m)"; print_streams; echo; continue; fi
+    out=$(print_streams) || continue
+    jq -cs --arg r "$(basename "$m")" --arg p "$m" \
+      '{repo: $r, path: $p, streams: (map(select(.status == "blocked")) + map(select(.status != "blocked")))}' <<<"$out"
+  done < <(if ((${#mains[@]})); then printf '%s\n' "${mains[@]}" | sort -u; fi) |
+    if ((json)); then
+      jq -s --arg g "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg h "$host" '{generated_at: $g, host: $h, repos: .}'
+    else cat; fi
+}
+
+# One stream's diff, log, progress or agent screen. -j wraps it as {text, truncated}; either way
+# the text stops at 200 KB.
+cmd_show() {
+  local want=$1 what=$2 limit=204800 path="" p b w tmp truncated=false ag target
+  case $what in diff|progress|screen|log) ;; *) die "show: what must be diff, progress, screen or log, not '$what'" ;; esac
+  load_streams || exit 1
+  while IFS=$'\t' read -r p b w; do
+    [[ -n $p && $b == "$want" ]] && { path=$p; break; }
+  done <<<"$stream_tsv"
+  [[ -n $path ]] || die "$want is not a herd stream of $main"
+  tmp=$(mktemp "${TMPDIR:-/tmp}/herd-show.XXXXXX")
+  # shellcheck disable=SC2064  # expand $tmp now
+  trap "rm -f '$tmp' '$tmp.cut'" EXIT
+  case $what in
+    diff) git -C "$path" diff "$base" >"$tmp" || die "could not diff $want against $base" ;;
+    log) git -C "$path" log --oneline "$base..HEAD" >"$tmp" || die "could not read $want's log against $base" ;;
+    progress) [[ ! -f $path/.herd/run/PROGRESS.md ]] || cat "$path/.herd/run/PROGRESS.md" >"$tmp" ;;
+    screen)
+      load_agents; ag=$(stream_agent "$path")
+      target=$(jq -r '.pane_id // .name // empty' <<<"$ag")
+      if [[ -n $target ]]; then
+        h agent read "$target" --source recent-unwrapped --lines 200 >"$tmp" 2>/dev/null \
+          || die "could not read the screen of $want's agent"
+      fi ;;
+  esac
+  if (($(wc -c <"$tmp") > limit)); then
+    truncated=true; head -c "$limit" "$tmp" >"$tmp.cut"; mv "$tmp.cut" "$tmp"
+  fi
+  if ((json)); then jq -n --rawfile t "$tmp" --argjson tr "$truncated" '{text: $t, truncated: $tr}'
+  else cat "$tmp"; fi
 }
 
 # --- the desktop backend: herdr's CLI, answered by herdr-core (hc) and the Herdr app ------------
@@ -1106,15 +1260,300 @@ cmd_draft() {
   else echo "review it, then start it with: herd -f $out" >&2; fi
 }
 
+# --- herd serve: the web page and its API ---------------------------------------------------------
+# serve/herd_serve.py does the serving; this finds its files and settings and execs it. Settings
+# come from the plugin's herd.conf (HERD_SERVE_LISTEN, _PORT, _READ_ONLY, _HOSTS, _REPOS, plus
+# HERD_BASE, HERD_KIND, HERD_AGENT_ARGS and HERD_RELAY_HOST); flags win over them.
+
+# The plugin's herd.conf: $HERD_CONF, else herdr's config dir for the plugin, else the plugin's
+# own fallback. May not exist.
+herd_conf() {
+  local d
+  [[ -n ${HERD_CONF:-} ]] && { echo "$HERD_CONF"; return; }
+  d=${HERDR_PLUGIN_CONFIG_DIR:-$(herdr plugin config-dir lordmuffin.herd 2>/dev/null || true)}
+  echo "${d:-${XDG_CONFIG_HOME:-$HOME/.config}/herd/plugin}/herd.conf"
+}
+
+# herd serve's state (tokens, the nudge file the plugin's event hook touches). Not herdr's plugin
+# state dir: herd serve also runs outside herdr, where that dir is unknown.
+serve_state_dir() { echo "${HERD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herd}"; }
+
+# herd.conf's settings, with herd serve's defaults first. Sets conf to the file's path.
+serve_conf() {
+  conf=$(herd_conf)
+  HERD_SERVE_LISTEN="" HERD_SERVE_PORT=8380 HERD_SERVE_READ_ONLY=0 HERD_SERVE_HOSTS=""
+  HERD_BASE=origin/main HERD_RELAY_APP_URL="" HERD_SERVE_REPOS="" HERD_KIND=claude HERD_AGENT_ARGS=""
+  # shellcheck source=/dev/null
+  [[ -f $conf ]] && source "$conf"
+  return 0
+}
+
+serve_tokens() { echo "$(serve_state_dir)/serve-tokens.json"; }
+
+# 32 random bytes as URL-safe base64, like the server's secrets.token_urlsafe(32).
+new_token() { head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n'; }
+
+# Replaces the tokens file with JSON $1, atomically, mode 0600 in a 0700 dir. A running herd serve
+# notices the new file on its next request.
+write_tokens() {
+  local f; f=$(serve_tokens)
+  (umask 077; mkdir -p "${f%/*}" && jq . <<<"$1" >"$f.$$" && mv -f "$f.$$" "$f") || die "serve: cannot write $f"
+}
+
+# The tokens file, made with two new tokens if it doesn't exist yet.
+ensure_tokens() {
+  local f; f=$(serve_tokens)
+  [[ -f $f ]] && return
+  write_tokens "$(jq -cn --arg r "$(new_token)" --arg c "$(new_token)" '{reader: $r, controller: $c}')"
+  echo "herd: wrote new reader and controller tokens to $f" >&2
+}
+
+is_loopback_addr() { [[ $1 == 127.* || $1 == localhost || $1 == ::1 ]]; }
+
+# Where a browser can reach herd serve: the listen address (not a wildcard), then HERD_SERVE_HOSTS.
+serve_addrs() {
+  local a seen=" "
+  for a in ${HERD_SERVE_LISTEN:-127.0.0.1} ${HERD_SERVE_HOSTS//,/ }; do
+    [[ $a == 0.0.0.0 || $a == :: || $seen == *" $a "* ]] && continue
+    seen+="$a "; echo "$a"
+  done
+}
+
+cmd_serve_pair() {
+  local role=controller a url tok qr=0
+  while (($#)); do
+    case $1 in
+      --reader) role=reader; shift ;;
+      --listen) [[ $# -ge 2 ]] || die "serve pair: --listen needs an address"; listen=$2; shift 2 ;;
+      -h|--help) echo "usage: herd serve pair [--reader] [--listen ADDR]"; exit ;;
+      *) die "serve pair: unknown option '$1' (want --reader, --listen ADDR)" ;;
+    esac
+  done
+  serve_conf
+  [[ -z ${listen:-} ]] || HERD_SERVE_LISTEN=$listen
+  ensure_tokens
+  tok=$(jq -r --arg r "$role" '.[$r] // empty' "$(serve_tokens)")
+  [[ -n $tok ]] || die "serve pair: no $role token in $(serve_tokens)"
+  have qrencode && qr=1
+  if [[ $role == controller ]]; then
+    echo "Pair a device by opening this on it. Controller token: it can start, finish and discard streams (--reader: look only)."
+  else
+    echo "Pair a device by opening this on it. Reader token: it can look, not change anything."
+  fi
+  while IFS= read -r a; do
+    url="http://$([[ $a == *:* ]] && echo "[$a]" || echo "$a"):$HERD_SERVE_PORT/#t=$tok"
+    echo
+    if is_loopback_addr "$a"; then echo "  $url   (this computer only)"; continue; fi
+    echo "  $url"
+    ((qr)) && qrencode -t ansiutf8 "$url"
+  done < <(serve_addrs)
+  if ! serve_addrs | grep -qv '^127\.\|^localhost$\|^::1$'; then
+    echo; echo "For a phone, listen on an address it can reach: HERD_SERVE_LISTEN=<netbird ip> in $conf, or HERD_SERVE_HOSTS for a name."
+  elif ((!qr)); then
+    echo; echo "Install qrencode to get a QR code to scan here as well."
+  fi
+  echo; echo "The link carries a secret: open it only on your own devices. herd serve revoke --$role signs them all out."
+}
+
+cmd_serve_revoke() {
+  local roles=() f doc r
+  while (($#)); do
+    case $1 in
+      --reader) roles+=(reader) ;;
+      --controller) roles+=(controller) ;;
+      -h|--help) echo "usage: herd serve revoke [--reader|--controller]   (both without a flag)"; exit ;;
+      *) die "serve revoke: unknown option '$1' (want --reader or --controller)" ;;
+    esac
+    shift
+  done
+  ((${#roles[@]})) || roles=(reader controller)
+  ensure_tokens
+  f=$(serve_tokens); doc=$(cat "$f")
+  for r in "${roles[@]}"; do doc=$(jq -c --arg r "$r" --arg t "$(new_token)" '.[$r] = $t' <<<"$doc"); done
+  write_tokens "$doc"
+  echo "herd: new ${roles[*]} token(s) in $f. Every device paired with the old one is signed out; a running herd serve takes the new one at once."
+  echo "Pair your devices again with: herd serve pair$([[ ${roles[*]} == reader ]] && echo " --reader")"
+}
+
+# herd serve's argv for a service, as herd.conf sets it. --listen is explicit there, so a
+# non-loopback HERD_SERVE_LISTEN is used (herd serve refuses one from herd.conf alone).
+serve_argv() {
+  local d; d=$(script_dir "${BASH_SOURCE[0]}")
+  argv=("$BASH" "$d/herd" serve --listen "${HERD_SERVE_LISTEN:-127.0.0.1}" --port "$HERD_SERVE_PORT")
+  [[ $HERD_SERVE_READ_ONLY == 1 ]] && argv+=(--read-only)
+  return 0
+}
+
+serve_unit() { echo "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/herd-serve.service"; }
+serve_plist() { echo "$HOME/Library/LaunchAgents/lordmuffin.herd-serve.plist"; }
+
+# One word of a systemd ExecStart= or Environment= line.
+sd_quote() {
+  local s=${1//\\/\\\\}
+  s=${s//\"/\\\"} s=${s//%/%%} s=${s//\$/\$\$}
+  printf '"%s"' "$s"
+}
+
+xml_esc() { local s=${1//&/&amp;}; s=${s//</&lt;} s=${s//>/&gt;}; printf '%s' "$s"; }
+
+cmd_serve_install() {
+  [[ $# -eq 0 ]] || die "serve install takes no arguments: it reads herd.conf ($(herd_conf))"
+  local argv=() a f line="" uid
+  serve_conf
+  ensure_tokens   # off loopback, herd serve only starts with tokens made beforehand
+  serve_argv
+  case $(uname -s) in
+    Linux)
+      have systemctl || die "serve install: no systemctl here; start herd serve some other way"
+      f=$(serve_unit)
+      for a in "${argv[@]}"; do line+="${line:+ }$(sd_quote "$a")"; done
+      mkdir -p "${f%/*}"
+      cat >"$f" <<EOF
+# Written by herd serve install; herd serve uninstall removes it. Settings come from herd.conf:
+# change them there and run herd serve install again.
+[Unit]
+Description=herd serve: herd's streams as a web page and API
+After=network-online.target
+
+[Service]
+ExecStart=$line
+Environment=$(sd_quote "PATH=$PATH") $(sd_quote "HERD_CONF=$conf")
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+      echo "wrote $f:"; sed 's/^/  /' "$f"
+      systemctl --user daemon-reload
+      systemctl --user enable --now herd-serve.service
+      systemctl --user restart herd-serve.service   # a reinstall picks up new settings
+      echo "herd serve runs as a systemd user service: systemctl --user status herd-serve, journalctl --user -u herd-serve."
+      echo "It stops when you log out unless lingering is on (loginctl enable-linger)."
+      ;;
+    Darwin)
+      f=$(serve_plist); uid=$(id -u)
+      mkdir -p "${f%/*}" "$(serve_state_dir)"
+      {
+        cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Written by herd serve install; herd serve uninstall removes it. Settings come from herd.conf. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>lordmuffin.herd-serve</string>
+  <key>ProgramArguments</key>
+  <array>
+EOF
+        for a in "${argv[@]}"; do printf '    <string>%s</string>\n' "$(xml_esc "$a")"; done
+        cat <<EOF
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$(xml_esc "$PATH")</string>
+    <key>HERD_CONF</key><string>$(xml_esc "$conf")</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>StandardErrorPath</key><string>$(xml_esc "$(serve_state_dir)/serve.log")</string>
+</dict>
+</plist>
+EOF
+      } >"$f"
+      echo "wrote $f:"; sed 's/^/  /' "$f"
+      launchctl bootout "gui/$uid" "$f" >/dev/null 2>&1 || true
+      launchctl bootstrap "gui/$uid" "$f"
+      echo "herd serve runs as a launchd agent (lordmuffin.herd-serve); its log is $(serve_state_dir)/serve.log."
+      ;;
+    *) die "serve install knows systemd (Linux) and launchd (macOS), not $(uname -s)" ;;
+  esac
+}
+
+cmd_serve_uninstall() {
+  [[ $# -eq 0 ]] || die "serve uninstall takes no arguments"
+  local f
+  case $(uname -s) in
+    Linux)
+      f=$(serve_unit)
+      [[ -f $f ]] || { echo "herd: no herd serve unit at $f"; return; }
+      systemctl --user disable --now herd-serve.service || true
+      rm -f "$f"
+      systemctl --user daemon-reload
+      echo "removed $f" ;;
+    Darwin)
+      f=$(serve_plist)
+      [[ -f $f ]] || { echo "herd: no herd serve agent at $f"; return; }
+      launchctl bootout "gui/$(id -u)" "$f" >/dev/null 2>&1 || true
+      rm -f "$f"
+      echo "removed $f" ;;
+    *) die "serve uninstall knows systemd (Linux) and launchd (macOS), not $(uname -s)" ;;
+  esac
+}
+
+cmd_serve() {
+  local d f py="" web="" plugin="" conf listen="" port="" ro=0 args=() a agent=()
+  case ${1:-} in
+    pair | revoke | install | uninstall) f=$1; shift; "cmd_serve_$f" "$@"; return ;;
+  esac
+  while (($#)); do
+    case $1 in
+      --listen) [[ $# -ge 2 ]] || die "serve: --listen needs an address"; listen=$2; shift 2 ;;
+      --port) [[ ${2:-} =~ ^[0-9]+$ ]] || die "serve: --port needs a number"; port=$2; shift 2 ;;
+      --read-only) ro=1; shift ;;
+      -h|--help) echo "usage: herd serve [--listen ADDR] [--port N] [--read-only] | pair [--reader] | revoke [--reader|--controller] | install | uninstall"; exit ;;
+      *) die "serve: unknown option '$1' (want --listen ADDR, --port N, --read-only)" ;;
+    esac
+  done
+  serve_conf
+  read -ra agent <<<"$HERD_AGENT_ARGS"
+  d=$(script_dir "${BASH_SOURCE[0]}")
+  for f in "$d/../serve/herd_serve.py" "$d/../share/herd/serve/herd_serve.py"; do
+    [[ -f $f ]] && { py=$f; break; }
+  done
+  for f in "$d/../web" "$d/../share/herd/web"; do
+    [[ -f $f/index.html ]] && { web=$f; break; }
+  done
+  for f in "$d/../plugin/herd-plugin.sh" "$d/../share/herd/plugin/herd-plugin.sh"; do
+    [[ -f $f ]] && { plugin=$f; break; }
+  done
+  [[ -n $py && -n $web ]] || die "serve: cannot find serve/herd_serve.py and web/ next to $d"
+  have python3 || die "serve: needs python3 (herd itself doesn't; only herd serve does)"
+  args=(--port "${port:-$HERD_SERVE_PORT}" --state-dir "$(serve_state_dir)" --web "$web"
+        --base "$HERD_BASE" --hosts "$HERD_SERVE_HOSTS" --relay-app-url "$HERD_RELAY_APP_URL"
+        --relay-host "$(herd_host)" --repos "$HERD_SERVE_REPOS" --kind "$HERD_KIND" --plugin "$plugin")
+  # = keeps an arg like --permission-mode from reading as one of the server's own flags.
+  for a in "${agent[@]}"; do args+=("--agent-arg=$a"); done
+  # Only a --listen given here counts as explicit; the server refuses a non-loopback address from
+  # herd.conf alone.
+  if [[ -n $listen ]]; then args+=(--listen "$listen")
+  elif [[ -n $HERD_SERVE_LISTEN ]]; then args+=(--conf-listen "$HERD_SERVE_LISTEN"); fi
+  [[ $ro == 1 || $HERD_SERVE_READ_ONLY == 1 ]] && args+=(--read-only)
+  [[ -n ${HERD_RELAY_HOST:-} ]] && export HERD_RELAY_HOST
+  # The plugin's plan actions (which herd serve runs) read the same herd.conf.
+  [[ -n ${HERDR_PLUGIN_CONFIG_DIR:-} || $(basename "$conf") != herd.conf ]] \
+    || export HERDR_PLUGIN_CONFIG_DIR=${conf%/*}
+  exec python3 "$py" "${args[@]}" --herd "$BASH" "$d/herd"
+}
+
 [[ $backend != bad:* ]] || die "HERD_BACKEND is desktop or tui, not '${backend#bad:}'"
 
 case ${1:-} in
   version|--version|-V) cmd_version; exit ;;
   backend) echo "$backend"; exit ;;
+  serve) shift; cmd_serve "$@"; exit ;;
   ls) shift; cmd_ls; exit ;;
-  status) shift; json=0; while getopts "r:j" o; do case $o in r) repo=$OPTARG;; j) json=1;; *) exit 2;; esac; done
+  status) shift; json=0 all=0
+      while getopts "r:b:ja" o; do case $o in r) repo=$OPTARG;; b) base=$OPTARG;; j) json=1;; a) all=1;; *) exit 2;; esac; done
+      shift $((OPTIND-1)); [[ $# -eq 0 ]] || die "status takes no arguments, only options"
+      if ((all)); then cmd_status_all; exit; fi
       repo=${repo:-$(git rev-parse --show-toplevel)}; repo=$(cd "$repo" && git rev-parse --show-toplevel); cmd_status; exit ;;
-  personas) shift; [[ $# -le 1 ]] || die "personas takes at most one name"
+  show) shift; json=0
+      while getopts "b:j" o; do case $o in b) base=$OPTARG;; j) json=1;; *) exit 2;; esac; done
+      shift $((OPTIND-1)); [[ $# -eq 3 ]] || die "show needs <repo-path> <branch> diff|progress|screen|log"
+      [[ -d $1 ]] || die "no such repo: $1"
+      repo=$(cd "$1" && git rev-parse --show-toplevel) || die "$1 is not a git repo"; cmd_show "$2" "$3"; exit ;;
+  personas) shift; json=0; [[ ${1:-} == -j ]] && { json=1; shift; }
+      [[ $# -le 1 ]] || die "personas takes at most one name"
       repo=$(git rev-parse --show-toplevel 2>/dev/null || true); cmd_personas "$@"; exit ;;
   "done") shift; while getopts "r:b:Ff:" o; do case $o in r) repo=$OPTARG;; b) base=$OPTARG;; F) force=1;; f) file=$OPTARG;; *) exit 2;; esac; done
       shift $((OPTIND-1)); targets=("$@"); [[ -n $file || $# -gt 0 ]] || file=$(default_file)
