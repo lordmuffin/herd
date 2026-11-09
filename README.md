@@ -269,6 +269,37 @@ Stock `/usr/bin/column` and `curl` are fine. For `herd done`, add `brew install 
 its token lands in `~/Library/Application Support/forgejo-cli.forgejo-cli/keys.json` (the
 doubled name is the `directories` crate's macOS layout), which `herd` checks after the XDG path.
 
+**Windows** — herd is a bash script and needs a Linux userland (`column` and `uuidgen` from
+util-linux, GNU `sed`/`install`), so run it under [WSL2](https://learn.microsoft.com/windows/wsl/install)
+and keep herdr, git, your agents and your repos all inside the WSL distro. From PowerShell:
+
+```powershell
+wsl --install -d Ubuntu      # once; reboot if asked, then open the Ubuntu shell
+```
+
+Then, inside Ubuntu:
+
+```bash
+sudo apt update && sudo apt install -y git jq curl make util-linux
+curl -fsSL https://releases.herdr.dev/app/install.sh | sh   # the Linux herdr, inside WSL
+git clone https://github.com/lordmuffin/herd.git && cd herd
+make install                 # into ~/.local/bin; or make link for a dev checkout
+```
+
+Alternatively, install the release tarball as in **Release tarball** above. Check that
+`~/.local/bin` is on `PATH` (Ubuntu's `~/.profile` adds it once the directory exists, so open a
+new shell), then start herdr in WSL and run `herd` from one of its panes. herdr's Linux build is a desktop
+app, so it opens through WSLg (built into WSL2 on Windows 11 and recent Windows 10). For `herd done`,
+install `gh` or forgejo-cli inside WSL, not on Windows.
+
+Keep repos on the Linux filesystem (`~/src/...`), not under `/mnt/c`. Git and worktrees are
+much slower across the Windows mount, and Windows-side git can rewrite line endings.
+
+herdr also ships a native Windows build (`irm https://releases.herdr.dev/app/install.ps1 | iex`),
+but herd isn't tested with it. herd has to run in a bash pane that can call `herdr`, and
+neither Git Bash nor MSYS2 provides `column`/`uuidgen` from util-linux out of the box. Use
+WSL2 unless you want to experiment.
+
 ## Develop
 
 `make test` runs `bash -n`, `shellcheck -S warning` and `tests/plan.sh` (the `herd plan` stage
