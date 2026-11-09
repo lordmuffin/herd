@@ -891,16 +891,23 @@ hd_close() {
   if ! herdr-app "do" space.close --id "$sp" --confirmed true >/dev/null 2>&1; then
     for t in $(hc ls --json --label "herdr.space=$sp" | jq -r '.terminals[].address'); do hc kill "$t" >/dev/null || true; done
   fi
-  # Finished terminals keep their screens around until removed.
+  # The terminals end a moment later (hangup, then harder); then their finished screens can go.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [[ $(hc ls --json --label "herdr.space=$sp" | jq '.terminals | length') == 0 ]] && break
+    sleep 0.5
+  done
   for t in $(hc ls --all --json --label "herdr.space=$sp" | jq -r '.terminals[] | select(.state != "live") | .address'); do
     hc rm "$t" >/dev/null 2>&1 || true
   done
 }
 
 # agent start <name> --kind k --pane <terminal> [--timeout ms] -- args: type the agent into the
-# shell, then wait (up to the timeout) for its first status report.
+# shell, then wait (up to the timeout) for its first status report. A folder-trust question on its
+# screen is the person's to answer, so while one shows herd waits for them (up to $hd_ask_wait s)
+# and says so, here and, best effort, as a toast from the herd mod if the app shows it.
+hd_ask_wait=${HERD_ASK_WAIT:-600}
 hd_start() {
-  local name=$1 k=claude t="" ms=90000 cmd line="" a end; shift
+  local name=$1 k=claude t="" ms=90000 cmd line="" a end asked=0 n=0 dir; shift
   while (($#)); do
     case $1 in --kind) k=$2; shift 2 ;; --pane) t=$2; shift 2 ;; --timeout) ms=$2; shift 2 ;; --) shift; break ;; *) shift ;; esac
   done
@@ -911,10 +918,20 @@ hd_start() {
   hc send "$t" "${line% }" --json >/dev/null || return 1
   end=$((SECONDS + ms / 1000))
   while ((SECONDS < end)); do
-    [[ -n $(hc get "$t" --json | jq -r '.status.state // empty') ]] && return 0
+    a=$(hc get "$t" --json 2>/dev/null | jq -r 'if .state == "live" then .status.state // "" else "gone" end') || a=gone
+    [[ $a == gone ]] && { echo "herd: $name's terminal ended before the agent started" >&2; return 1; }
+    [[ -n $a ]] && return 0
+    if ((!asked && n++ % 3 == 0)) && hc read "$t" 2>/dev/null | grep -qiE 'trust (this|the) folder|do you trust'; then
+      asked=1 end=$((SECONDS + hd_ask_wait))
+      dir=$(hc get "$t" --json | jq -r '.labels["herd.path"] // .cwd')
+      echo "herd: $name asks whether to trust $dir — answer it in its space; waiting up to $((hd_ask_wait / 60)) min" >&2
+      herdr-app "do" "herd.notice:$(hc get "$t" --json | jq -c --arg n "$name" --arg d "$dir" '{space: .labels["herdr.space"],
+        title: "\($n) asks to trust its folder", body: "Answer it in its space (\($d)); herd waits, then sends the task."}')" >/dev/null 2>&1 || true
+    fi
     sleep 1
   done
-  echo "herd: $name did not report a status within $((ms / 1000))s (a trust or login prompt?)" >&2
+  if ((asked)); then echo "herd: nobody answered $name's trust question in time" >&2
+  else echo "herd: $name did not report a status within $((ms / 1000))s (a login prompt?)" >&2; fi
   return 1
 }
 

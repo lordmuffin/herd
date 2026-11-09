@@ -22,6 +22,7 @@ bad() { fail=$((fail + 1)); echo "  FAIL $1"; [[ -z ${2:-} ]] || sed 's/^/      
 check() { local name=$1; shift; if "$@"; then ok "$name"; else bad "$name" "$(cat "$T/out" "$T/calls" 2>/dev/null)"; fi; }
 called() { grep -qF -- "$1" "$T/calls" 2>/dev/null; }
 ORIG_PATH=$PATH
+jq_quiet() { jq -e "$@" >/dev/null; }
 
 setup() {
   T=$(mktemp -d)
@@ -147,6 +148,24 @@ setup; touch "$T/no-status"
   hd_start feat-a --kind claude --pane "$(hc run --bg --json --name feat-a --cwd "$T" | jq -r .address)" --timeout 0 ) >"$T/out" 2>&1; rc=$?
 check "fails and says why" eval 'test $rc -ne 0 && grep -q "did not report a status" "$T/out"'
 
+echo "an agent asking whether to trust its folder"
+setup; touch "$T/no-status"
+printf ' Quick safety check: Is this a project you created or one you trust?\n ❯ No, exit\n   Yes, I trust this folder\n' >"$T/screen"
+( set -e; repo=$T/proj; backend=desktop; hd_ask_wait=0; sleep() { :; }
+  hd_start feat-a --kind claude --pane "$(hc run --bg --json --name feat-a --cwd "$T" --label herdr.space=sp1 --label "herd.path=$T/wt" | jq -r .address)" --timeout 5000 ) >"$T/out" 2>&1; rc=$?
+check "says the person has to answer it, and where" grep -q "feat-a asks whether to trust $T/wt — answer it in its space" "$T/out"
+check "tells the herd mod, with the space to go to" \
+  bash -c "grep '^herdr-app do herd.notice:' '$T/calls' | sed 's/^herdr-app do herd.notice://' | jq -e '.space == \"sp1\" and (.title | test(\"trust\"))' >/dev/null"
+check "never answers it itself" bash -c "! grep -qE '^hc (keys|send t1 (y|1|$))' '$T/calls'"
+check "gives up once the wait is over" eval 'test $rc -ne 0 && grep -q "nobody answered" "$T/out"'
+
+echo "a terminal closed before its agent started"
+setup; touch "$T/no-status"
+( set -e; repo=$T/proj; backend=desktop; sleep() { :; }
+  t=$(hc run --bg --json --name feat-a --cwd "$T" | jq -r .address); hc kill "$t"
+  hd_start feat-a --kind claude --pane "$t" --timeout 600000 ) >"$T/out" 2>&1; rc=$?
+check "stops at once instead of waiting out the timeout" eval 'test $rc -ne 0 && grep -q "ended before the agent started" "$T/out"'
+
 # --- status, wait, rm --------------------------------------------------------------------------
 echo "herd status and -w in the app"
 setup; run_herd -b main -w
@@ -155,7 +174,7 @@ mkdir -p "$wt/.herd/run"; printf 'stage=2\nstatus=running\n' >"$wt/.herd/run/sta
 printf '## Stage 1: a\n## Stage 2: b\n## Stage 3: c\n' >"$wt/.herd/run/stages.md"
 (cd "$repo" && HERD_BACKEND=desktop "$herd" status -j) >"$T/out" 2>&1
 check "status -j: branch, agent, live status, plan stage and the space" \
-  jq -e --arg sp "$(term feat-a '.labels["herdr.space"]')" \
+  jq_quiet --arg sp "$(term feat-a '.labels["herdr.space"]')" \
     'select(.branch == "feat/a") | .agent == "feat-a" and .status == "done" and .plan == "stage 2/3 running" and .workspace == $sp' "$T/out"
 (cd "$repo" && HERD_BACKEND=desktop "$herd" ls) >"$T/out" 2>&1
 check "herd ls lists the agent" grep -qE '^feat-a +claude-code +done +' "$T/out"
