@@ -41,6 +41,8 @@
 #                                     # rotate a token: signs out every device holding it
 #   herd serve install | uninstall    # run herd serve as a systemd user unit / launchd agent
 #   herd version                      # print the version (also --version, -V)
+#   herd backend                      # which herdr this drives: tui (the terminal herdr) or desktop
+#                                     # (the Herdr app, through hc); HERD_BACKEND=desktop|tui picks
 #   herd personas [-j] [<name>]       # list personas (-j: as JSON), or print one as a
 #                                     # ready-to-paste prompt
 #   herd rm [-f file] <branch|name>...        # remove worktree, workspace and local branch
@@ -75,7 +77,28 @@ repo="" base="origin/main" kind="claude" machine="" parent="" parent_ws="" wait=
 persona="" dry=0 json=0 bg_wait=60 bg_poll=${HERD_BG_POLL:-30}
 
 die() { echo "herd: $*" >&2; exit 1; }
-h() { if [[ -n $machine ]]; then herdr --machine "$machine" "$@"; else herdr "$@"; fi; }
+
+# Which herdr herd drives: "tui", the terminal herdr (herdr's CLI), or "desktop", the Herdr app
+# (herdr-core's hc, and herdr-app). HERD_BACKEND=desktop|tui decides; otherwise the innermost
+# terminal does: a herdr pane (or a herdr plugin) is tui, a herdr-core terminal (HC_TERMINAL_ID,
+# which every Herdr app terminal has) is desktop, and anywhere else is tui, as before.
+pick_backend() {
+  case ${HERD_BACKEND:-} in
+    desktop | tui) echo "$HERD_BACKEND" ;;
+    "") if [[ -n ${HERDR_PLUGIN_ID:-} || ${TERM_PROGRAM:-} == herdr ]]; then echo tui
+        elif [[ -n ${HC_TERMINAL_ID:-} ]]; then echo desktop
+        else echo tui; fi ;;
+    *) echo "bad:$HERD_BACKEND" ;;
+  esac
+}
+backend=${backend:-$(pick_backend)}
+
+h() {
+  if [[ $backend == desktop ]]; then hd "$@"; return; fi
+  if [[ -n $machine ]]; then herdr --machine "$machine" "$@"; else herdr "$@"; fi
+}
+# How to look at an agent's screen, for error messages.
+read_hint() { if [[ $backend == desktop ]]; then echo "hc read $1"; else echo "herdr agent read $1"; fi; }
 agent_name() { local n; n=$(tr 'A-Z/._' 'a-z---' <<<"$1" | tr -cd 'a-z0-9_-'); n=${n#[-_0-9]}; echo "${n:0:32}"; }
 
 # The comment block at the top of this file, minus its leading "# ".
@@ -229,9 +252,9 @@ find_wt() {
 }
 
 remove_wt() {
-  if [[ $ws != "-" ]]; then
-    h worktree remove --workspace "$ws" --force >/dev/null
-  else
+  [[ $ws == "-" ]] || h worktree remove --workspace "$ws" --force >/dev/null
+  # herdr removes the checkout with its workspace; the desktop app only closes the space.
+  if [[ $ws == "-" || $backend == desktop ]]; then
     git -C "$repo" worktree remove --force "$path"
   fi
   git -C "$repo" branch -D "$branch" >/dev/null 2>&1 || true
@@ -410,13 +433,13 @@ create_agent() {
   wt_pane=$(jq -r '.result.root_pane.pane_id' <<<"$out")
 
   h agent start "$wt_name" --kind "$kind" --pane "$wt_pane" --timeout 90000 -- "${agent_args[@]}" >/dev/null \
-    || die "agent start failed for $wt_name (pane $wt_pane) — inspect with: herdr agent read $wt_name"
+    || die "agent start failed for $wt_name (pane $wt_pane) — inspect with: $(read_hint "$wt_name")"
 }
 
 # Wait only until the turn has visibly started, so a later `agent wait` can't see the pre-prompt idle.
 send_prompt() {
   h agent prompt "$1" "$2" --wait --until working --until blocked --until "done" --timeout 30000 >/dev/null \
-    || die "prompt not picked up by $1 — inspect with: herdr agent read $1"
+    || die "prompt not picked up by $1 — inspect with: $(read_hint "$1")"
 }
 
 spawn() {
@@ -927,6 +950,183 @@ cmd_show() {
   else cat "$tmp"; fi
 }
 
+# --- the desktop backend: herdr's CLI, answered by herdr-core (hc) and the Herdr app ------------
+# hd takes the herdr calls herd makes and answers them in herdr's JSON shapes, so everything above
+# runs unchanged on either backend:
+#   workspace              a space. Its terminals carry herdr.space/herdr.tab labels, which is all
+#                          the app needs to show them (it adopts ids it doesn't know as new spaces)
+#   worktree create/open   git worktree add, then a kept shell in the checkout (hc run), in a new
+#                          space that doesn't take focus; the "pane" is that terminal's address
+#   worktree remove        space.close (or, with no app running, hc kill on the space's terminals)
+#   worktree list          git worktree list, each with the space a live terminal of it sits in
+#   agent start            the agent typed into that shell (it stays open after the agent exits, as
+#                          in the app), then waits for the agent's first status report
+#   agent prompt/wait/get/read/list   hc send / wait / get / read / ls
+#   workspace list, pane list         empty: the app nests worktree spaces under their repo itself
+# Every terminal herd starts is named after its agent and labelled herd=1, herd.path, herd.branch.
+
+# Single-quoted for any shell the app's terminals run (sh, bash, zsh, fish).
+shq() { local q="'\\''"; printf "'%s'" "${1//\'/$q}"; }
+
+# Every live terminal, with labels, status and current folder (hc get each), as one JSON array.
+hd_terms() {
+  local a
+  for a in $(hc ls --json | jq -r '.terminals[] | select(.state == "live") | .address'); do
+    hc get "$a" --json 2>/dev/null || true
+  done | jq -s '.'
+}
+
+# The folder that counts for a terminal: where herd put it, else where it is now.
+hd_cwd='(.labels["herd.path"] // .foreground.cwd // .cwd)'
+
+hd_agents() {
+  hd_terms | jq "{result: {agents: [.[] | select(.status != null) | {
+      name: (.name // .address), agent: (.status.app // .agent // \"-\"), agent_status: .status.state,
+      cwd: $hd_cwd, pane_id: .address, workspace_id: .labels[\"herdr.space\"]}]}}"
+}
+
+hd_agent() {
+  hc get "$1" --json | jq "{result: {agent: {name: (.name // .address), agent_status: (.status.state // \"unknown\"),
+      cwd: $hd_cwd, pane_id: .address}}}"
+}
+
+# worktree list [--cwd dir]: each checkout, and the space showing it (the deepest checkout a
+# terminal is in wins, so a worktree inside the main checkout isn't counted as the main one).
+hd_worktrees() {
+  local cwd=$PWD terms
+  [[ ${1:-} == --cwd ]] && cwd=$2
+  terms=$(hd_terms)
+  git -C "$cwd" worktree list --porcelain | jq -R -s --argjson terms "$terms" "
+    [split(\"\n\n\")[] | split(\"\n\") | select(any(.[]; startswith(\"worktree \")))
+      | select(any(.[]; . == \"bare\") | not)
+      | {path: ([.[] | select(startswith(\"worktree \")) | .[9:]][0]),
+         branch: ([.[] | select(startswith(\"branch \")) | .[7:] | sub(\"^refs/heads/\"; \"\")][0])}]
+    | [to_entries[] | .value + {is_linked_worktree: (.key > 0)}] as \$wts
+    | [\$wts[].path] as \$paths
+    | [\$terms[] | select(.labels[\"herdr.space\"] != null) | $hd_cwd as \$c
+        | {space: .labels[\"herdr.space\"],
+           at: ([\$paths[] | select(\$c == . or (\$c | startswith(. + \"/\")))] | max_by(length))}] as \$hits
+    | {result: {worktrees: [\$wts[] | .path as \$p
+        | . + {open_workspace_id: ([\$hits[] | select(.at == \$p) | .space][0])}]}}"
+}
+
+# worktree create|open --cwd repo --path p --label name [--branch b --base ref]: the checkout, then a
+# kept shell in it, in a new space of its own.
+hd_space() {
+  local sub=$1 cwd="" br="" from="" dir="" label="" sp out; shift
+  while (($#)); do
+    case $1 in
+      --cwd) cwd=$2; shift 2 ;; --branch) br=$2; shift 2 ;; --base) from=$2; shift 2 ;;
+      --path) dir=$2; shift 2 ;; --label) label=$2; shift 2 ;; --workspace) shift 2 ;; *) shift ;;
+    esac
+  done
+  cwd=${cwd:-$repo}
+  if [[ $sub == create ]]; then
+    mkdir -p "$(dirname "$dir")"
+    if git -C "$cwd" show-ref --quiet --verify "refs/heads/$br"; then
+      git -C "$cwd" worktree add -q "$dir" "$br" >&2 || return 1
+    else
+      git -C "$cwd" worktree add -q -b "$br" "$dir" "$from" >&2 || return 1
+    fi
+    br=$(git -C "$dir" rev-parse --abbrev-ref HEAD)
+  fi
+  sp="herd-$label-$(date +%s)"
+  out=$(hc run --bg --json --keep --no-parent --name "$label" --cwd "$dir" \
+          --label "herdr.space=$sp" --label "herdr.tab=$sp-1" \
+          --label herd=1 --label "herd.path=$dir" --label "herd.branch=$br") || return 1
+  jq --arg sp "$sp" '{result: {workspace: {workspace_id: $sp}, root_pane: {pane_id: .address}}}' <<<"$out"
+}
+
+# worktree remove --workspace <space>: close the space, which ends its terminals.
+hd_close() {
+  local sp="" t
+  while (($#)); do case $1 in --workspace) sp=$2; shift 2 ;; *) shift ;; esac; done
+  [[ -n $sp ]] || return 1
+  if ! herdr-app "do" space.close --id "$sp" --confirmed true >/dev/null 2>&1; then
+    for t in $(hc ls --json --label "herdr.space=$sp" | jq -r '.terminals[].address'); do hc kill "$t" >/dev/null || true; done
+  fi
+  # The terminals end a moment later (hangup, then harder); then their finished screens can go.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [[ $(hc ls --json --label "herdr.space=$sp" | jq '.terminals | length') == 0 ]] && break
+    sleep 0.5
+  done
+  for t in $(hc ls --all --json --label "herdr.space=$sp" | jq -r '.terminals[] | select(.state != "live") | .address'); do
+    hc rm "$t" >/dev/null 2>&1 || true
+  done
+}
+
+# agent start <name> --kind k --pane <terminal> [--timeout ms] -- args: type the agent into the
+# shell, then wait (up to the timeout) for its first status report. A folder-trust question on its
+# screen is the person's to answer, so while one shows herd waits for them (up to $hd_ask_wait s)
+# and says so, here and, best effort, as a toast from the herd mod if the app shows it.
+hd_ask_wait=${HERD_ASK_WAIT:-600}
+hd_start() {
+  local name=$1 k=claude t="" ms=90000 cmd line="" a end asked=0 n=0 dir; shift
+  while (($#)); do
+    case $1 in --kind) k=$2; shift 2 ;; --pane) t=$2; shift 2 ;; --timeout) ms=$2; shift 2 ;; --) shift; break ;; *) shift ;; esac
+  done
+  cmd=("$k")
+  [[ $k == codex ]] && cmd+=(--no-daemon)   # a shared Codex daemon would run its commands outside hc
+  for a in "${cmd[@]}" "$@"; do line+="$(shq "$a") "; done
+  hc label "$t" "herd.kind=$k" >/dev/null || return 1
+  hc send "$t" "${line% }" --json >/dev/null || return 1
+  end=$((SECONDS + ms / 1000))
+  while ((SECONDS < end)); do
+    a=$(hc get "$t" --json 2>/dev/null | jq -r 'if .state == "live" then .status.state // "" else "gone" end') || a=gone
+    [[ $a == gone ]] && { echo "herd: $name's terminal ended before the agent started" >&2; return 1; }
+    [[ -n $a ]] && return 0
+    if ((!asked && n++ % 3 == 0)) && hc read "$t" 2>/dev/null | grep -qiE 'trust (this|the) folder|do you trust'; then
+      asked=1 end=$((SECONDS + hd_ask_wait))
+      dir=$(hc get "$t" --json | jq -r '.labels["herd.path"] // .cwd')
+      echo "herd: $name asks whether to trust $dir — answer it in its space; waiting up to $((hd_ask_wait / 60)) min" >&2
+      herdr-app "do" "herd.notice:$(hc get "$t" --json | jq -c --arg n "$name" --arg d "$dir" '{space: .labels["herdr.space"],
+        title: "\($n) asks to trust its folder", body: "Answer it in its space (\($d)); herd waits, then sends the task."}')" >/dev/null 2>&1 || true
+    fi
+    sleep 1
+  done
+  if ((asked)); then echo "herd: nobody answered $name's trust question in time" >&2
+  else echo "herd: $name did not report a status within $((ms / 1000))s (a login prompt?)" >&2; fi
+  return 1
+}
+
+# agent prompt <name> <text> [--wait ...]: hc send returns once the program took the text; with
+# --wait, the turn must have started (herdr's --until working|blocked|done).
+hd_prompt() {
+  local out
+  out=$(hc send "$1" "$2" --json) || return 1
+  [[ " ${*:3} " != *" --wait "* ]] || [[ $(jq -r '.started' <<<"$out") == true ]]
+}
+
+# agent wait <name>: until its turn ends. hc wait checks in every so often, and a message to the
+# terminal herd runs in ends it too; neither means the agent stopped.
+hd_wait() {
+  local out
+  while :; do
+    out=$(hc wait "$1" --json --timeout 600 2>/dev/null) || true
+    [[ $(jq -r '.reason // empty' <<<"$out" 2>/dev/null) =~ ^(timeout|message)$ ]] || break
+  done
+  hd_agent "$1"
+}
+
+hd() {
+  command -v hc >/dev/null || die "the desktop backend needs herdr-core's hc on PATH"
+  [[ -z $machine ]] || die "-m is not supported with the Herdr app yet (HERD_BACKEND=tui uses the terminal herdr)"
+  case "$1 ${2:-}" in
+    "agent list") hd_agents ;;
+    "agent get") hd_agent "$3" ;;
+    "agent wait") hd_wait "$3" ;;
+    "agent read") hc read "$3" ;;
+    "agent prompt") shift 2; hd_prompt "$@" ;;
+    "agent start") shift 2; hd_start "$@" ;;
+    "worktree list") shift 2; hd_worktrees "$@" ;;
+    "worktree create" | "worktree open") shift; hd_space "$@" ;;
+    "worktree remove") shift 2; hd_close "$@" ;;
+    "workspace list") echo '{"result":{"workspaces":[]}}' ;;
+    "pane list") echo '{"result":{"panes":[]}}' ;;
+    *) die "no desktop mapping for: herdr $*" ;;
+  esac
+}
+
 # Sourced (by tests/plan.sh): define the functions above, run nothing.
 [[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
 
@@ -1335,8 +1535,11 @@ cmd_serve() {
   exec python3 "$py" "${args[@]}" --herd "$BASH" "$d/herd"
 }
 
+[[ $backend != bad:* ]] || die "HERD_BACKEND is desktop or tui, not '${backend#bad:}'"
+
 case ${1:-} in
   version|--version|-V) cmd_version; exit ;;
+  backend) echo "$backend"; exit ;;
   serve) shift; cmd_serve "$@"; exit ;;
   ls) shift; cmd_ls; exit ;;
   status) shift; json=0 all=0
@@ -1439,6 +1642,10 @@ if ((dry)); then
   exit
 fi
 
+if [[ $backend == desktop ]]; then
+  [[ -z $parent ]] || echo "herd: -p is ignored in the Herdr app, whose sidebar nests worktrees under their repo" >&2
+  parent=""
+fi
 parent_ws=$(pick_parent)
 [[ -n $parent_ws ]] && echo "grouping under workspace $parent_ws"
 names=()

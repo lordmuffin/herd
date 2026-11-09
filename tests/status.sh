@@ -9,6 +9,7 @@ root=$(cd "$here/.." && pwd)
 herd=$root/bin/herd
 # Run inside a herdr pane, these would reach the real herdr and its workspaces.
 unset HERDR_BIN_PATH HERDR_SOCKET_PATH HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_PANE_ID HERD_RELAY_HOST
+export HERD_BACKEND=tui   # the fake herdr below, also when run in the Herdr app
 
 pass=0 fail=0
 ok() { pass=$((pass + 1)); echo "  ok   $1"; }

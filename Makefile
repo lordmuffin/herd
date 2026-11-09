@@ -4,15 +4,18 @@ SHARE  := $(DESTDIR)$(PREFIX)/share/herd
 VERSION := $(shell head -n1 VERSION)
 GITHUB_REMOTE ?= github
 HERDR  ?= herdr
+# The Herdr app's home, and where `make desktop-install` puts the herd mod.
+HERDR_APP_HOME ?= $(HOME)/.config/herdr-app
+DESKTOP_MOD := $(HERDR_APP_HOME)/mods/herd
 
-.PHONY: test install link uninstall plugin-link plugin-unlink dist sync-github clean
+.PHONY: test install link uninstall plugin-link plugin-unlink desktop-install desktop-uninstall dist sync-github clean
 
 test:
 	bash -n bin/herd
 	bash -n plugin/herd-plugin.sh
 	bash -n plugin/dashboard.sh
 	python3 -m py_compile serve/herd_serve.py
-	shellcheck -S warning bin/herd plugin/herd-plugin.sh plugin/dashboard.sh tests/plan.sh tests/worktree.sh tests/pr.sh tests/args.sh tests/version.sh tests/plugin.sh tests/status.sh tests/serve.sh packaging/release-assets.sh
+	shellcheck -S warning bin/herd plugin/herd-plugin.sh plugin/dashboard.sh tests/plan.sh tests/worktree.sh tests/pr.sh tests/args.sh tests/version.sh tests/plugin.sh tests/status.sh tests/serve.sh tests/desktop.sh packaging/release-assets.sh
 	bash tests/plan.sh
 	bash tests/worktree.sh
 	bash tests/pr.sh
@@ -21,6 +24,7 @@ test:
 	bash tests/plugin.sh packaging/release-assets.sh
 	bash tests/status.sh
 	bash tests/serve.sh
+	bash tests/desktop.sh
 
 # Copy into $(PREFIX) (default ~/.local). PKGBUILD uses this with PREFIX=/usr. The herdr plugin
 # lands in share/herd too, so `herdr plugin link $(PREFIX)/share/herd` registers it, and so do
@@ -55,6 +59,20 @@ plugin-link:
 
 plugin-unlink:
 	$(HERDR) plugin unlink lordmuffin.herd
+
+# Copy the herd mod into the Herdr app (mods are copied in, as the app's AGENTS.md says to), with
+# this checkout's herd bundled in it, so the mod runs the herd it was built for. Then check it.
+# Re-run after changing desktop/ or bin/herd; the app reloads the mod when its files change.
+desktop-install:
+	mkdir -p $(DESKTOP_MOD)/herd/bin $(DESKTOP_MOD)/herd/personas
+	install -m644 desktop/mods/herd/mod.json desktop/mods/herd/*.js $(DESKTOP_MOD)/
+	install -m755 bin/herd $(DESKTOP_MOD)/herd/bin/herd
+	install -m644 VERSION $(DESKTOP_MOD)/herd/VERSION
+	install -m644 personas/*.md $(DESKTOP_MOD)/herd/personas/
+	herdr-app check $(DESKTOP_MOD)
+
+desktop-uninstall:
+	rm -rf $(DESKTOP_MOD)
 
 # Source tarball of HEAD plus SHA256SUMS in dist/ (what the release workflow publishes).
 dist:
