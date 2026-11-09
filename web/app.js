@@ -1,6 +1,8 @@
 // herd's page: the streams of `herd serve`, phone first. Vanilla JS, no build, no network but
 // this server. The data is herd's own JSON (docs/serve-api.md): /api/snapshot over the event
 // stream, /api/show for a stream's text, /api/config for the relay deep link's settings.
+// With the controller token, the New sheet and the detail view's buttons POST to the write routes
+// (/api/start, draft, fanout, plan, plan-resume, done, rm), which run herd on the computer.
 //
 // Answering an agent happens in the Herdr Mobile app, not here: every stream links to it with the
 // relay's deep link, <app url>/#notify=<encodeURIComponent(JSON.stringify({pane_id, host}))>.
@@ -12,10 +14,16 @@ const SCREEN_LINES = 6; // lines of a blocked agent's screen shown as its questi
 const FETCH_TIMEOUT = 15000;
 const BACKOFF_MIN = 1000;
 const BACKOFF_MAX = 30000;
+const REPO_KEY = "herd.repo";
+const PERSONA_KEY = "herd.persona";
+const RECENT_KEY = "herd.recent";
+const RECENT_MAX = 10;
+// A write waits as long as the server lets herd run it: a draft or a fan-out runs agents.
+const WRITE_WAIT = { start: 330e3, draft: 930e3, fanout: 930e3, plan: 90e3, done: 330e3, rm: 150e3 };
 
 const state = {
   token: null,
-  config: null, // {relay_app_url, relay_host}
+  config: null, // {relay_app_url, relay_host, read_only, repos, role}
   snap: null, // the last snapshot
   lastUpdate: null, // Date of the last snapshot
   live: false,
@@ -26,6 +34,8 @@ const state = {
   detail: null, // {repo, branch} while the detail view is open
   tab: "progress",
   tabSeq: 0,
+  personas: new Map(), // repo -> [{name, description}] for the persona pickers
+  drafted: null, // {repo, file, hash} of the last draft, for its Fan out button
 };
 
 const $ = (id) => document.getElementById(id);
@@ -83,18 +93,20 @@ function forget() {
   state.config = null;
   state.screens.clear();
   disconnect();
+  hideSheet();
   showPair("");
 }
 
 // --- network ------------------------------------------------------------------------------------
 
-// GET an /api route as JSON. Never throws: {ok, status, data}.
-async function api(path) {
+// An /api request, its answer as JSON. Never throws: {ok, status, data}.
+async function request(path, init, timeout) {
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), FETCH_TIMEOUT);
+  const timer = setTimeout(() => ctl.abort(), timeout || FETCH_TIMEOUT);
   try {
     const res = await fetch(path, {
-      headers: { Authorization: "Bearer " + state.token },
+      ...init,
+      headers: { Authorization: "Bearer " + state.token, ...(init.headers || {}) },
       cache: "no-store",
       signal: ctl.signal,
     });
@@ -111,6 +123,13 @@ async function api(path) {
     clearTimeout(timer);
   }
 }
+
+// GET an /api route.
+const api = (path) => request(path, {});
+
+// POST a JSON body to an /api route. The server answers {ok, output, error, request_id}.
+const post = (path, body, timeout) =>
+  request(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, timeout);
 
 function connect() {
   disconnect();
@@ -173,7 +192,7 @@ function scheduleReconnect() {
     if (!state.token) return;
     const r = await api("/api/config");
     if (r.status === 401) return showPair("This device's token was not accepted. Pair it again.");
-    if (r.ok) state.config = r.data;
+    if (r.ok) setConfig(r.data);
     if (r.ok) connect();
     else scheduleReconnect();
   }, wait);
@@ -240,6 +259,7 @@ function render() {
   $("host").textContent = snap.host ? " · " + snap.host : "";
   $("counts").textContent = counts(snap) || "no streams";
   if (state.detail) renderDetailHead();
+  updateFab();
   $("overview").hidden = !!state.detail;
   $("detail").hidden = !state.detail;
 
@@ -373,6 +393,7 @@ function lastLines(text, n) {
 function openDetail(repo, branch) {
   state.detail = { repo, branch };
   history.pushState({ detail: true }, "");
+  resetActions();
   render();
   window.scrollTo(0, 0);
   selectTab(state.tab);
@@ -391,10 +412,13 @@ function renderDetailHead() {
   const head = $("detail-head");
   if (!found) {
     head.replaceChildren(h("h2.d-branch", null, branch), h("p.hint", null, "This stream is gone: it was finished or discarded."));
+    for (const id of ["act-resume", "act-done", "act-discard", "discard-confirm"]) $(id).hidden = true;
     return;
   }
   const { repo: r, s } = found;
   const p = s.plan_detail;
+  $("act-resume").hidden = !(p && p.status !== "complete");
+  $("act-done").hidden = $("act-discard").hidden = false;
   const timeline = p && (p.stages || []).length
     ? h(
         "ol.timeline",
@@ -425,7 +449,7 @@ function renderDetailHead() {
 
 async function selectTab(what) {
   state.tab = what;
-  for (const b of document.querySelectorAll(".tabs [role=tab]")) b.setAttribute("aria-selected", String(b.dataset.what === what));
+  for (const b of document.querySelectorAll("#detail .tabs [role=tab]")) b.setAttribute("aria-selected", String(b.dataset.what === what));
   const pre = $("tab-text");
   if (!state.detail) return;
   const { repo, branch } = state.detail;
@@ -460,6 +484,283 @@ function diffClass(line) {
   return "";
 }
 
+// --- writes: shared -----------------------------------------------------------------------------
+
+function setConfig(config) {
+  state.config = config;
+  updateFab();
+  if (state.detail) $("detail-actions").hidden = !canWrite();
+}
+
+// Only the controller token may write, and only when herd serve isn't --read-only.
+const canWrite = () => !!(state.token && state.config && state.config.role === "controller" && !state.config.read_only);
+
+function updateFab() {
+  $("new").hidden = !canWrite() || !!state.detail || !$("sheet").hidden;
+}
+
+// Shows a write's answer in a <pre>: herd's output, its error, the request id.
+function showResult(pre, res) {
+  const d = res.data || {};
+  const good = res.ok && d.ok === true;
+  let text;
+  if (res.status === 0) {
+    text = "No answer from herd serve: offline, or it took too long. Check on the computer before trying again; it may have run.";
+  } else {
+    const out = (d.output || "").trim();
+    text = [out, d.error && !out.includes(d.error) ? d.error : null].filter(Boolean).join("\n") || (good ? "done" : "error " + res.status);
+  }
+  if (d.request_id) text += "\n(request " + d.request_id + ")";
+  pre.textContent = text;
+  pre.classList.toggle("good", good);
+  pre.classList.toggle("bad", !good);
+  pre.hidden = false;
+  return good;
+}
+
+// Runs one write with its button(s) disabled and "busy" as the label meanwhile.
+async function runWrite(buttons, busy, pre, path, body, timeout) {
+  const labels = buttons.map((b) => b.textContent);
+  for (const b of buttons) b.disabled = true;
+  if (buttons[0]) buttons[0].textContent = busy;
+  pre.hidden = false;
+  pre.classList.remove("good", "bad");
+  pre.textContent = busy;
+  const res = await post(path, body, timeout);
+  buttons.forEach((b, i) => {
+    b.disabled = false;
+    b.textContent = labels[i];
+  });
+  return { res, good: showResult(pre, res) };
+}
+
+function basename(p) {
+  return p.replace(/\/+$/, "").split("/").pop() || p;
+}
+
+// The repos the sheet offers: those with streams, then HERD_SERVE_REPOS.
+function repoList() {
+  const seen = new Map();
+  for (const r of (state.snap && state.snap.repos) || []) seen.set(r.path, r.repo || basename(r.path));
+  for (const p of (state.config && state.config.repos) || []) if (!seen.has(p)) seen.set(p, basename(p));
+  return [...seen].map(([path, name]) => ({ path, name }));
+}
+
+function fillRepos() {
+  const repos = repoList();
+  const want = load(REPO_KEY);
+  for (const sel of document.querySelectorAll(".repo-pick")) {
+    const cur = sel.value || want;
+    if (!repos.length) {
+      sel.replaceChildren(h("option", { value: "" }, "no repos: set HERD_SERVE_REPOS in herd.conf"));
+      continue;
+    }
+    sel.replaceChildren(...repos.map((r) => h("option", { value: r.path, title: r.path }, r.name + " · " + r.path)));
+    if (repos.some((r) => r.path === cur)) sel.value = cur;
+  }
+}
+
+// Fills a form's persona picker with `herd personas` for its repo.
+async function fillPersonas(form) {
+  const sel = form.elements.persona;
+  if (!sel) return;
+  const repo = form.elements.repo.value;
+  if (!state.personas.has(repo)) {
+    const r = await api("/api/personas?" + new URLSearchParams({ repo }));
+    if (r.ok) state.personas.set(repo, r.data.personas || []);
+  }
+  const list = state.personas.get(repo) || [];
+  const cur = sel.value || load(PERSONA_KEY) || "";
+  sel.replaceChildren(
+    h("option", { value: "" }, "herd's default"),
+    h("option", { value: "none" }, "none (the prompt alone)"),
+    ...list.map((p) => h("option", { value: p.name, title: p.description || "" }, p.name)),
+  );
+  if ([...sel.options].some((o) => o.value === cur)) sel.value = cur;
+}
+
+function remember(body) {
+  if (body.repo) store(REPO_KEY, body.repo);
+  if (body.persona != null) store(PERSONA_KEY, body.persona);
+}
+
+// --- writes: the New sheet ------------------------------------------------------------------------
+
+function openSheet() {
+  if (!canWrite()) return;
+  history.pushState({ sheet: true }, "");
+  $("sheet").hidden = false;
+  document.body.classList.add("sheet-open");
+  updateFab();
+  fillRepos();
+  for (const f of document.querySelectorAll("#sheet form")) fillPersonas(f);
+  renderRecent();
+  const open = document.querySelector("#sheet form:not([hidden]) textarea");
+  if (open) open.focus();
+}
+
+function hideSheet() {
+  $("sheet").hidden = true;
+  document.body.classList.remove("sheet-open");
+  updateFab();
+}
+
+function selectForm(name) {
+  for (const b of document.querySelectorAll("#sheet [role=tab]")) b.setAttribute("aria-selected", String(b.dataset.form === name));
+  for (const f of document.querySelectorAll("#sheet form")) f.hidden = f.dataset.form !== name;
+}
+
+// A branch name from a prompt: "Fix the flaky login test" -> fix/flaky-login-test.
+const PREFIX = { fix: "fix", bug: "fix", repair: "fix", add: "feat", implement: "feat", feat: "feat", build: "feat",
+  make: "feat", support: "feat", docs: "docs", document: "docs", refactor: "refactor", test: "test", tests: "test",
+  chore: "chore", remove: "chore", update: "chore", bump: "chore" };
+const STOP = new Set("the a an to of and in for on with from into that this is are be it its by as at or so".split(" "));
+
+function suggestBranch(prompt) {
+  const words = prompt.toLowerCase().match(/[a-z0-9]+/g) || [];
+  if (!words.length) return "";
+  let prefix = "feat";
+  if (PREFIX[words[0]]) prefix = PREFIX[words.shift()];
+  const slug = words.filter((w) => !STOP.has(w)).slice(0, 4).join("-").slice(0, 40).replace(/-+$/, "");
+  return slug ? prefix + "/" + slug : "";
+}
+
+function loadRecent() {
+  try {
+    const r = JSON.parse(load(RECENT_KEY) || "[]");
+    return Array.isArray(r) ? r.filter((x) => typeof x === "string") : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function rememberPrompt(prompt) {
+  const p = prompt.trim();
+  if (!p) return;
+  store(RECENT_KEY, JSON.stringify([p, ...loadRecent().filter((x) => x !== p)].slice(0, RECENT_MAX)));
+}
+
+function renderRecent() {
+  const list = loadRecent();
+  const form = $("f-task");
+  $("recent").hidden = !list.length;
+  $("recent-list").replaceChildren(
+    ...list.map((p) =>
+      h("button.recent-item", {
+        type: "button",
+        title: p,
+        onclick: () => {
+          form.elements.prompt.value = p;
+          onPromptInput();
+          form.elements.prompt.focus();
+        },
+      }, p),
+    ),
+  );
+}
+
+function onPromptInput() {
+  const f = $("f-task").elements;
+  if (!f.branch.dataset.touched) f.branch.value = suggestBranch(f.prompt.value);
+}
+
+async function submitTask(ev) {
+  ev.preventDefault();
+  const form = ev.target;
+  const f = form.elements;
+  const body = { repo: f.repo.value, branch: f.branch.value.trim(), persona: f.persona.value, prompt: f.prompt.value };
+  remember(body);
+  rememberPrompt(body.prompt);
+  const { good } = await runWrite([form.querySelector(".go")], "Starting…", form.querySelector(".result"), "/api/start", body, WRITE_WAIT.start);
+  if (good) {
+    f.prompt.value = "";
+    f.branch.value = "";
+    delete f.branch.dataset.touched;
+  }
+  renderRecent();
+}
+
+// The task lines of a drafted file, without its comment header.
+const taskLines = (text) => (text || "").split("\n").filter((l) => l.trim() && !/^\s*#/.test(l)).join("\n");
+
+function showDrafted(form, file, lines) {
+  const box = form.querySelector(".drafted");
+  box.hidden = false;
+  box.querySelector(".drafted-file").textContent = file;
+  box.querySelector(".drafted-text").textContent = lines;
+  box.querySelector(".fanout-result").hidden = true;
+}
+
+async function submitDraft(ev) {
+  ev.preventDefault();
+  const form = ev.target;
+  const f = form.elements;
+  const body = { repo: f.repo.value, goal: f.goal.value };
+  remember(body);
+  state.drafted = null;
+  form.querySelector(".drafted").hidden = true;
+  const { res, good } = await runWrite([form.querySelector(".go")], "Drafting… (a minute or two)", form.querySelector(".result"), "/api/draft", body, WRITE_WAIT.draft);
+  const d = res.data || {};
+  if (!good || !d.file) return;
+  state.drafted = { repo: body.repo, file: d.file, hash: d.hash || null };
+  showDrafted(form, d.file, taskLines(d.text));
+  form.querySelector(".fanout").disabled = !d.hash;
+}
+
+// Fans out the last draft with its preview's hash. A stale hash (the file changed) gets a fresh
+// preview instead, to look at before tapping again.
+async function fanOutDraft() {
+  const form = $("f-draft");
+  const d = state.drafted;
+  if (!d) return;
+  const btn = form.querySelector(".fanout");
+  const pre = form.querySelector(".fanout-result");
+  const { res, good } = await runWrite([btn], "Starting the agents…", pre, "/api/fanout", { repo: d.repo, file: d.file, hash: d.hash }, WRITE_WAIT.fanout);
+  if (good) {
+    state.drafted = null;
+    btn.disabled = true;
+    return;
+  }
+  if (res.status !== 409) return;
+  const again = await post("/api/fanout?dry=1", { repo: d.repo, file: d.file }, FETCH_TIMEOUT);
+  if (again.ok && again.data.ok && again.data.hash) {
+    d.hash = again.data.hash;
+    form.querySelector(".drafted-text").textContent = (again.data.output || "").trim();
+    pre.textContent = d.file + " changed since its preview. Above is what it would start now; tap Fan out again to start it.";
+  }
+}
+
+async function submitPlan(ev) {
+  ev.preventDefault();
+  const form = ev.target;
+  const f = form.elements;
+  const body = { repo: f.repo.value, branch: f.branch.value.trim(), plan_text: f.plan_text.value, verify: f.verify.value.trim(), persona: f.persona.value };
+  remember(body);
+  const { good } = await runWrite([form.querySelector(".go")], "Starting…", form.querySelector(".result"), "/api/plan", body, WRITE_WAIT.plan);
+  if (good) f.plan_text.value = "";
+}
+
+// --- writes: the detail view's buttons ------------------------------------------------------------
+
+function resetActions() {
+  $("detail-actions").hidden = !canWrite();
+  $("discard-confirm").hidden = true;
+  $("discard-word").value = "";
+  $("discard-go").disabled = true;
+  $("act-result").hidden = true;
+}
+
+const actButtons = () => ["act-resume", "act-done", "act-discard", "discard-go"].map($);
+
+async function act(path, extra, busy, timeout) {
+  if (!state.detail) return;
+  const { repo, branch } = state.detail;
+  const body = path === "/api/plan-resume" ? { repo, branch } : { repo, branches: [branch], ...extra };
+  await runWrite(actButtons(), busy, $("act-result"), path, body, timeout);
+  if (path === "/api/rm") $("discard-confirm").hidden = true;
+  $("discard-go").disabled = $("discard-word").value.trim() !== "discard";
+}
+
 // --- start --------------------------------------------------------------------------------------
 
 function showPair(error) {
@@ -488,7 +789,7 @@ async function start() {
   const r = await api("/api/config");
   if (r.status === 401) return showPair("This device's token was not accepted. Pair it again.");
   if (r.ok) {
-    state.config = r.data;
+    setConfig(r.data);
     render();
   }
 }
@@ -497,9 +798,33 @@ document.addEventListener("DOMContentLoaded", () => {
   $("forget").addEventListener("click", forget);
   $("back").addEventListener("click", () => history.back());
   $("reload").addEventListener("click", () => selectTab(state.tab));
-  for (const b of document.querySelectorAll(".tabs [role=tab]")) b.addEventListener("click", () => selectTab(b.dataset.what));
+  for (const b of document.querySelectorAll("#detail .tabs [role=tab]")) b.addEventListener("click", () => selectTab(b.dataset.what));
   window.addEventListener("popstate", () => {
-    if (state.detail) closeDetail();
+    if (!$("sheet").hidden) hideSheet();
+    else if (state.detail) closeDetail();
+  });
+  $("new").addEventListener("click", openSheet);
+  $("sheet-close").addEventListener("click", () => history.back());
+  for (const b of document.querySelectorAll("#sheet [role=tab]")) b.addEventListener("click", () => selectForm(b.dataset.form));
+  for (const sel of document.querySelectorAll(".repo-pick")) sel.addEventListener("change", () => fillPersonas(sel.form));
+  $("f-task").addEventListener("submit", submitTask);
+  $("f-draft").addEventListener("submit", submitDraft);
+  $("f-plan").addEventListener("submit", submitPlan);
+  $("f-task").elements.prompt.addEventListener("input", onPromptInput);
+  $("f-task").elements.branch.addEventListener("input", (ev) => {
+    if (ev.target.value) ev.target.dataset.touched = "1";
+    else delete ev.target.dataset.touched;
+  });
+  $("f-draft").querySelector(".fanout").addEventListener("click", fanOutDraft);
+  $("act-resume").addEventListener("click", () => act("/api/plan-resume", null, "Resuming…", WRITE_WAIT.plan));
+  $("act-done").addEventListener("click", () => act("/api/done", null, "Checking…", WRITE_WAIT.done));
+  $("act-discard").addEventListener("click", () => {
+    $("discard-confirm").hidden = false;
+    $("discard-word").focus();
+  });
+  $("discard-word").addEventListener("input", (ev) => ($("discard-go").disabled = ev.target.value.trim() !== "discard"));
+  $("discard-go").addEventListener("click", () => {
+    if ($("discard-word").value.trim() === "discard") act("/api/rm", { confirm: "discard" }, "Discarding…", WRITE_WAIT.rm);
   });
   // A phone wakes the page up after a long sleep: reconnect now instead of waiting out the backoff.
   document.addEventListener("visibilitychange", () => {

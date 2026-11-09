@@ -37,7 +37,8 @@
 #                                     # 127.0.0.1:8380 (needs python3; herd.conf HERD_SERVE_*
 #                                     # set the same; see docs/serve-api.md)
 #   herd version                      # print the version (also --version, -V)
-#   herd personas [<name>]            # list personas, or print one as a ready-to-paste prompt
+#   herd personas [-j] [<name>]       # list personas (-j: as JSON), or print one as a
+#                                     # ready-to-paste prompt
 #   herd rm [-f file] <branch|name>...        # remove worktree, workspace and local branch
 #   herd done [-F] [-f file] <branch|name>... # after merge: check PR merged + agent idle + tree
 #                                     # clean, then rm and delete the remote branch (-F skips checks)
@@ -177,7 +178,11 @@ cmd_personas() {
         desc=$(sed -n 's/^> //p' "$f" | head -1)
         printf '%s\t%s\t%s\n' "$n" "${desc:--}" "$f"
       done
-    done < <(persona_dirs); } | awk -F'\t' '!seen[$1]++' | column -t -s $'\t'
+    done < <(persona_dirs); } | awk -F'\t' '!seen[$1]++' |
+    if ((json)); then
+      jq -R -s -c '[split("\n")[] | select(length > 0) | split("\t")
+                    | {name: .[0], description: (if .[1] == "-" then null else .[1] end), path: .[2]}]'
+    else column -t -s $'\t'; fi
 }
 
 # Prints the repo root's Tasks.herd if there is one, and says so on stderr. With -m, -r is a path
@@ -1052,8 +1057,8 @@ cmd_draft() {
 
 # --- herd serve: the web page and its API ---------------------------------------------------------
 # serve/herd_serve.py does the serving; this finds its files and settings and execs it. Settings
-# come from the plugin's herd.conf (HERD_SERVE_LISTEN, _PORT, _READ_ONLY, _HOSTS, plus HERD_BASE
-# and HERD_RELAY_HOST); flags win over them.
+# come from the plugin's herd.conf (HERD_SERVE_LISTEN, _PORT, _READ_ONLY, _HOSTS, _REPOS, plus
+# HERD_BASE, HERD_KIND, HERD_AGENT_ARGS and HERD_RELAY_HOST); flags win over them.
 
 # The plugin's herd.conf: $HERD_CONF, else herdr's config dir for the plugin, else the plugin's
 # own fallback. May not exist.
@@ -1069,7 +1074,7 @@ herd_conf() {
 serve_state_dir() { echo "${HERD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herd}"; }
 
 cmd_serve() {
-  local d f py="" web="" conf listen="" port="" ro=0 args=()
+  local d f py="" web="" plugin="" conf listen="" port="" ro=0 args=() a agent=()
   while (($#)); do
     case $1 in
       --listen) [[ $# -ge 2 ]] || die "serve: --listen needs an address"; listen=$2; shift 2 ;;
@@ -1081,9 +1086,10 @@ cmd_serve() {
   done
   conf=$(herd_conf)
   HERD_SERVE_LISTEN="" HERD_SERVE_PORT=8380 HERD_SERVE_READ_ONLY=0 HERD_SERVE_HOSTS=""
-  HERD_BASE=origin/main HERD_RELAY_APP_URL=""
+  HERD_BASE=origin/main HERD_RELAY_APP_URL="" HERD_SERVE_REPOS="" HERD_KIND=claude HERD_AGENT_ARGS=""
   # shellcheck source=/dev/null
   [[ -f $conf ]] && source "$conf"
+  read -ra agent <<<"$HERD_AGENT_ARGS"
   d=$(script_dir "${BASH_SOURCE[0]}")
   for f in "$d/../serve/herd_serve.py" "$d/../share/herd/serve/herd_serve.py"; do
     [[ -f $f ]] && { py=$f; break; }
@@ -1091,17 +1097,25 @@ cmd_serve() {
   for f in "$d/../web" "$d/../share/herd/web"; do
     [[ -f $f/index.html ]] && { web=$f; break; }
   done
+  for f in "$d/../plugin/herd-plugin.sh" "$d/../share/herd/plugin/herd-plugin.sh"; do
+    [[ -f $f ]] && { plugin=$f; break; }
+  done
   [[ -n $py && -n $web ]] || die "serve: cannot find serve/herd_serve.py and web/ next to $d"
   have python3 || die "serve: needs python3 (herd itself doesn't; only herd serve does)"
   args=(--port "${port:-$HERD_SERVE_PORT}" --state-dir "$(serve_state_dir)" --web "$web"
         --base "$HERD_BASE" --hosts "$HERD_SERVE_HOSTS" --relay-app-url "$HERD_RELAY_APP_URL"
-        --relay-host "$(herd_host)")
+        --relay-host "$(herd_host)" --repos "$HERD_SERVE_REPOS" --kind "$HERD_KIND" --plugin "$plugin")
+  # = keeps an arg like --permission-mode from reading as one of the server's own flags.
+  for a in "${agent[@]}"; do args+=("--agent-arg=$a"); done
   # Only a --listen given here counts as explicit; the server refuses a non-loopback address from
   # herd.conf alone.
   if [[ -n $listen ]]; then args+=(--listen "$listen")
   elif [[ -n $HERD_SERVE_LISTEN ]]; then args+=(--conf-listen "$HERD_SERVE_LISTEN"); fi
   [[ $ro == 1 || $HERD_SERVE_READ_ONLY == 1 ]] && args+=(--read-only)
   [[ -n ${HERD_RELAY_HOST:-} ]] && export HERD_RELAY_HOST
+  # The plugin's plan actions (which herd serve runs) read the same herd.conf.
+  [[ -n ${HERDR_PLUGIN_CONFIG_DIR:-} || $(basename "$conf") != herd.conf ]] \
+    || export HERDR_PLUGIN_CONFIG_DIR=${conf%/*}
   exec python3 "$py" "${args[@]}" --herd "$BASH" "$d/herd"
 }
 
@@ -1119,7 +1133,8 @@ case ${1:-} in
       shift $((OPTIND-1)); [[ $# -eq 3 ]] || die "show needs <repo-path> <branch> diff|progress|screen|log"
       [[ -d $1 ]] || die "no such repo: $1"
       repo=$(cd "$1" && git rev-parse --show-toplevel) || die "$1 is not a git repo"; cmd_show "$2" "$3"; exit ;;
-  personas) shift; [[ $# -le 1 ]] || die "personas takes at most one name"
+  personas) shift; json=0; [[ ${1:-} == -j ]] && { json=1; shift; }
+      [[ $# -le 1 ]] || die "personas takes at most one name"
       repo=$(git rev-parse --show-toplevel 2>/dev/null || true); cmd_personas "$@"; exit ;;
   "done") shift; while getopts "r:b:Ff:" o; do case $o in r) repo=$OPTARG;; b) base=$OPTARG;; F) force=1;; f) file=$OPTARG;; *) exit 2;; esac; done
       shift $((OPTIND-1)); targets=("$@"); [[ -n $file || $# -gt 0 ]] || file=$(default_file)

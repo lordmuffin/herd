@@ -195,6 +195,17 @@ check "runs herd plan with the picked plan and the engineer default" out_has "fe
 check "notifies when the plan run ends" called "notification show herd: plan feat/p ended"
 setup; pane plan $'not a branch\n'
 check "refuses a bad branch name" out_has "not a valid branch name"
+setup
+(cd "$root" && HERD_REPO=$repo HERD_BRANCH=feat/q HERD_PLAN_FILE=$repo/PLAN.md HERD_PLAN_PERSONA=engineer \
+  bash "$plugin" pane plan <<<"") >"$T/out" 2>&1
+check "a filled-in plan form (from herd serve) runs herd plan without asking" \
+  bash -c "grep -qF 'branch feat/q, plan $repo/PLAN.md, persona engineer' '$T/out' && ! grep -q 'branch (e.g.' '$T/out'"
+check "...for real: the plan's worktree and agent start" \
+  bash -c "grep -qF 'worktree create --cwd $repo --branch feat/q' '$T/calls' && grep -qF 'agent start feat-q' '$T/calls'"
+: >"$T/calls"
+(HERD_REPO=$repo HERD_BRANCH=feat/q HERD_PLAN_FILE=$repo/PLAN.md HERD_PLAN_VERIFY="make test" bash "$plugin" action plan) >"$T/out" 2>&1
+check "the plan action hands a filled-in form to its pane, in the repo's workspace" \
+  called "--env HERD_REPO=$repo --env HERD_BRANCH=feat/q --env HERD_PLAN_FILE=$repo/PLAN.md --env HERD_PLAN_VERIFY=make test --workspace w1"
 setup; pane plan-resume ""
 check "no plan state, nothing to resume" out_has "no stopped plans"
 mkdir -p "$wt/.herd/run"; printf 'stage=1\nstatus=blocked\n' >"$wt/.herd/run/state"

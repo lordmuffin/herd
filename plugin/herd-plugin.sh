@@ -138,8 +138,19 @@ action() {
     menu | dashboard | fanout | draft | plan | plan-resume | status | "done" | rm | personas | settings) ;;
     *) echo "herd: unknown action '$1'" >&2; return 2 ;;
   esac
-  local repo; repo=$(resolve_repo) || repo=""
+  local repo v ws fwd=(); repo=$(resolve_repo) || repo=""
   if [[ $1 == dashboard && -n $repo ]]; then open_dashboard "$repo"; return; fi
+  # herd serve fills in the plan form on the phone: hand it to the pane, which then asks nothing,
+  # in a tab of the repo's own workspace (no pane is focused when the action comes from there).
+  if [[ $1 == plan || $1 == plan-resume ]]; then
+    for v in HERD_BRANCH HERD_PLAN_FILE HERD_PLAN_VERIFY HERD_PLAN_PERSONA; do
+      [[ -n ${!v:-} ]] && fwd+=("$v=${!v}")
+    done
+  fi
+  if ((${#fwd[@]})) && [[ -n $repo ]]; then
+    ws=$(repo_workspace "$repo")
+    open_pane "$1" "$repo" "${fwd[@]}" ${ws:+--workspace "$ws"}; return
+  fi
   open_pane "$1" "$repo"
 }
 
@@ -323,6 +334,25 @@ pane_plan() {
   need_repo || return
   local branch src files=() f verify persona dry=() tmp="" rc
   echo "Run a plan: one worktree, one branch, a chain of gated stages, one PR at the end."; hr
+  # Filled in already (herd serve's plan form): run it as given, no questions.
+  if [[ -n ${HERD_BRANCH:-} && -n ${HERD_PLAN_FILE:-} ]]; then
+    branch=$HERD_BRANCH src=$HERD_PLAN_FILE verify=${HERD_PLAN_VERIFY:-}
+    persona=${HERD_PLAN_PERSONA:-${HERD_PERSONA:-engineer}}
+    echo "branch $branch, plan $src${verify:+, verify $verify}, persona $persona"
+    [[ -f $src ]] || { echo "herd: no plan file $src"; return 1; }
+  else
+    pane_plan_ask || return
+  fi
+  hr
+  run_herd plan -r "$repo" -b "$HERD_BASE" -k "$HERD_KIND" ${verify:+-v "$verify"} -P "$persona" "${dry[@]}" \
+    "$branch" "$src" ${agent_args[0]:+-- "${agent_args[@]}"}
+  rc=$?
+  [[ -n $tmp ]] && rm -f "$tmp"
+  plan_notify "$branch" "$rc"
+}
+
+# pane_plan's questions; sets its branch, src, tmp, verify, persona and dry.
+pane_plan_ask() {
   while :; do
     ask branch "branch (e.g. feat/export-csv)"
     [[ -n $branch ]] || return
@@ -342,12 +372,7 @@ pane_plan() {
   ask verify "default verify command for stages without one (empty: none)"
   ask persona "stage persona" "${HERD_PERSONA:-engineer}"
   confirm "stop after planning, to review the stages first?" n && dry=(-n)
-  hr
-  run_herd plan -r "$repo" -b "$HERD_BASE" -k "$HERD_KIND" ${verify:+-v "$verify"} -P "$persona" "${dry[@]}" \
-    "$branch" "$src" ${agent_args[0]:+-- "${agent_args[@]}"}
-  rc=$?
-  [[ -n $tmp ]] && rm -f "$tmp"
-  plan_notify "$branch" "$rc"
+  return 0
 }
 
 plan_notify() { # branch rc

@@ -129,7 +129,9 @@ text itself.
 only; herd itself doesn't need Python). It binds `127.0.0.1:8380` by default (8375 and 8376 are the
 relay's). herd.conf's `HERD_SERVE_LISTEN`, `HERD_SERVE_PORT`, `HERD_SERVE_READ_ONLY=1` and
 `HERD_SERVE_HOSTS` set the same; flags win. It passes herd.conf's `HERD_BASE` as `-b` to every
-command below and exports `HERD_RELAY_HOST`.
+command below and exports `HERD_RELAY_HOST`. The write routes also take `HERD_KIND` (`-k`),
+`HERD_AGENT_ARGS` (after `--`) and `HERD_SERVE_REPOS`: repos to offer and allow besides those
+with streams (space or comma separated).
 
 | route | auth | answer |
 | --- | --- | --- |
@@ -139,7 +141,8 @@ command below and exports `HERD_RELAY_HOST`.
 | `GET /api/snapshot` | token | `herd status -j -a`, reused for 2 s (or until the nudge file changes) |
 | `GET /api/show?repo=&branch=&what=` | token | `herd show -j`; 404 unless `repo` is a `repos[].path` of the snapshot and `branch` one of its streams, 400 for a bad `what` |
 | `GET /api/events` | token, or `?t=<token>` | Server-Sent Events, below |
-| `GET /api/config` | token | `{relay_app_url, relay_host}`: herd.conf's `HERD_RELAY_APP_URL` (null when unset) and `HERD_RELAY_HOST` (else `hostname -s`), for the page's Herdr Mobile links. Nothing else, and never a token |
+| `GET /api/config` | token | `{relay_app_url, relay_host, read_only, repos, role}`: herd.conf's `HERD_RELAY_APP_URL` (null when unset) and `HERD_RELAY_HOST` (else `hostname -s`), for the page's Herdr Mobile links; whether the server is `--read-only`; `HERD_SERVE_REPOS` as real paths; and `reader` or `controller` for the token sent. Never a token |
+| `GET /api/personas[?repo=]` | token | `{personas: [{name, description}]}` from `herd personas -j`, run in the repo (so its `.herd/personas` count); 404 for a repo it doesn't know |
 
 A failing herd command is a 502 with `{error}`; every /api answer is `Cache-Control: no-store`.
 
@@ -153,8 +156,7 @@ failing check sends `event: error` with `{error}` and the stream carries on.
 first start on loopback writes `serve-tokens.json` there (mode 0600) with a `reader` and a
 `controller` token. Every /api route wants `Authorization: Bearer <token>` (401 without);
 `/api/events` also takes `?t=`, since EventSource can't set headers, and the server never logs a
-query string. Both tokens can read; only the controller will be able to write (no write routes
-yet: every POST is a 405).
+query string. Both tokens can read; only the controller can write.
 
 **Host check.** A request whose `Host` is not the bound address, `localhost` or a
 `HERD_SERVE_HOSTS` entry (space or comma separated) is a 403, `/healthz` included. This stops DNS
@@ -167,6 +169,36 @@ localStorage, drops the fragment from the address bar, and sends the token as a 
 (and as `?t=` to `/api/events`). Every stream links to the Herdr Mobile app with the relay's deep
 link, `<relay_app_url>#notify=<encodeURIComponent(JSON.stringify({pane_id, host}))>`, using the
 stream's `pane_id` and `host`. The service worker caches the shell only, never an /api answer.
+
+**Writes.** The POST routes below need the controller token: a reader token is a 403, no token a
+401, and `--read-only` makes every one a 405, controller or not. The body is a JSON object
+(`Content-Type: application/json`, at most 64 KB: 413 over, 415 for another type). Every answer
+is `{ok, output, error, request_id}` plus the route's own fields, with the request id also in
+`X-Request-Id`. A check that fails before herd runs is a 4xx with `ok: false`; once herd ran, the
+answer is a 200 whose `ok` is herd's exit status and whose `output` is its stdout and stderr; herd
+not running at all (or past its time) is a 502. `repo` must be a repo of the snapshot or of
+`HERD_SERVE_REPOS` (else 404). herd always runs with an argv, never a shell.
+
+| route | body | runs |
+| --- | --- | --- |
+| `POST /api/start` | `{repo, branch, persona, prompt}` | `herd -r <repo> -b <base> -k <kind> [-P <persona>] <branch> <prompt> [-- <agent args>]`. The branch is checked like `herd draft` checks a task line: `git check-ref-format --branch`, no whitespace, `@` or `:`, no leading `-`, not an existing local or `origin/` branch (409), a non-empty agent name. The persona is `""` (herd's default), `none`, or a name from `herd personas` |
+| `POST /api/draft` | `{repo, goal, output}` | `herd draft -r <repo> -b <base> -o <repo>/<output> -`, the goal on stdin (as an argument, a goal that names a file would be read). `output` must match `Tasks*.herd`, be a plain name in the repo root (no `/`, no symlink out) and not exist yet (409); empty picks `Tasks.herd`, else `Tasks-<date>.herd`. Answers also `file`, `text` (the saved file), `dry_run` (`herd -n -f`) and `hash` (as for a fan-out preview) |
+| `POST /api/fanout[?dry=1]` | `{repo, file, hash}` | With `?dry=1` (or `"dry": true`): `herd -n -r <repo> -f <file>`, answering `hash`. Without: `herd -r <repo> -b <base> -k <kind> -f <file> [-- <agent args>]`, only if `hash` is one a preview (or a draft) gave in the last 15 minutes and still matches the file (sha256 of repo, name and bytes): else 409, so a stale preview can't start a different batch. A hash starts one batch only. `file` must match `*.herd` in the repo root |
+| `POST /api/plan` | `{repo, branch, plan_text, verify, persona}` | Writes `plan_text` to `<repo>/.herd/inbox/<branch>.md` (added to the repo's `info/exclude`), then runs the herdr plugin's `plan` action with `HERD_REPO`, `HERD_BRANCH`, `HERD_PLAN_FILE`, `HERD_PLAN_VERIFY` and `HERD_PLAN_PERSONA` set. The action opens the `plan` pane in a herdr tab of the repo's workspace, which runs `herd plan` with them and asks nothing, so the driver lives in herdr, not in the server. The branch is checked as for start. 501 when herd serve finds no plugin next to herd |
+| `POST /api/plan-resume` | `{repo, branch}` | The plugin's `plan-resume` action with `HERD_BRANCH`, the same way; 409 unless the stream has a plan |
+| `POST /api/done` | `{repo, branches: []}` | `herd done -r <repo> -b <base> <branches>`, with its usual checks; each branch must be a stream of the snapshot (404) |
+| `POST /api/rm` | `{repo, branches: [], confirm: "discard"}` | `herd rm -r <repo> <branches>`; 400 without `confirm: "discard"` |
+
+Every POST to one of these routes (refused or not) adds one line to `<state dir>/serve-audit.jsonl`
+(mode 0600): `{ts, request_id, token_role, route, repo, branch, ok, status}`, plus `file` for
+draft and fanout. `branch` is a list for done and rm. A prompt, goal or plan is never logged: only
+`prompt_len`/`prompt_sha256`, `goal_len`/`goal_sha256` or `plan_len`/`plan_sha256`.
+
+The page's **New** button (controller only) opens a sheet with three tabs: Task (repo, prompt,
+branch suggested from the prompt, persona), Draft (repo, goal; then the drafted lines and Fan
+out, which sends the draft's hash) and Plan (repo, branch, plan, verify, persona). It keeps the
+last repo and persona and the last 10 prompts in localStorage. The detail view gets Resume plan,
+Done and Discard (which wants `discard` typed in). Results show inline.
 
 **Off loopback.** A non-loopback address needs `--listen` on the command line (one from herd.conf
 alone is refused) and the tokens file to exist already (start once on loopback to make it).

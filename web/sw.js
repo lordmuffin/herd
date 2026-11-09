@@ -4,7 +4,7 @@
 //
 // Served at /sw.js (not /static/) so its scope is the whole page.
 
-const CACHE = "herd-shell-1";
+const CACHE = "herd-shell-2";
 const SHELL = [
   "/",
   "/static/app.css",

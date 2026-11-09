@@ -532,3 +532,208 @@ pre {
 .forget {
   color: var(--muted);
 }
+
+/* --- writes: the New button, its sheet, the detail view's buttons --- */
+
+main {
+  padding-bottom: 88px; /* room for the New button over the last card */
+}
+
+.fab {
+  position: fixed;
+  right: max(16px, env(safe-area-inset-right));
+  bottom: calc(16px + env(safe-area-inset-bottom));
+  z-index: 5;
+  min-height: 56px;
+  padding: 0 22px;
+  border: none;
+  border-radius: 28px;
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 700;
+  font-size: 1.05rem;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+}
+
+body.sheet-open {
+  overflow: hidden;
+}
+
+.sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--bg);
+}
+
+.sheet-inner {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 8px max(12px, env(safe-area-inset-right)) calc(32px + env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+}
+
+.sheet-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sheet-bar h2 {
+  margin: 8px 0;
+  font-size: 1.3rem;
+}
+
+.tabs.three {
+  grid-template-columns: repeat(3, 1fr);
+  margin-top: 8px;
+  background: var(--bg);
+  z-index: 1;
+}
+
+.form label {
+  display: block;
+  margin-top: 14px;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.form select,
+.form input,
+.form textarea,
+.confirm input {
+  display: block;
+  width: 100%;
+  min-height: var(--tap);
+  margin-top: 6px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+  color: var(--text);
+  font: inherit;
+  font-size: 16px; /* under 16px, phones zoom in on focus */
+  font-weight: 400;
+}
+
+.form textarea {
+  resize: vertical;
+  line-height: 1.4;
+}
+
+.form .hint {
+  margin: 12px 0 0;
+}
+
+.go {
+  display: block;
+  width: 100%;
+  min-height: 52px;
+  margin-top: 16px;
+  border: none;
+  border-radius: 10px;
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 700;
+  font-size: 1.05rem;
+}
+
+.go:disabled,
+.act:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.result {
+  margin: 12px 0 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--code-bg);
+  font-size: 0.8rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.result.good {
+  border-color: var(--working);
+}
+
+.result.bad {
+  border-color: var(--blocked);
+  background: var(--blocked-bg);
+}
+
+.recent-title {
+  margin: 14px 0 6px;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.recent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.recent-item {
+  width: 100%;
+  min-height: var(--tap);
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+  text-align: left;
+  font-size: 0.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.drafted .text {
+  margin: 0;
+}
+
+.actions {
+  margin: 12px 0;
+}
+
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.act {
+  flex: 1 1 0;
+  min-width: 90px;
+  min-height: var(--tap);
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+  font-weight: 600;
+}
+
+.act.danger {
+  color: var(--blocked);
+  border-color: var(--blocked);
+}
+
+.confirm {
+  margin-top: 12px;
+  font-size: 0.9rem;
+}
+
+.confirm .action-row {
+  margin-top: 8px;
+}
+
+.confirm input {
+  flex: 1 1 140px;
+  width: auto;
+  margin-top: 0;
+}

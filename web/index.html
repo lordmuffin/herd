@@ -42,6 +42,21 @@
       <button id="back" class="back" type="button" aria-label="Back to all streams">‹ All streams</button>
     </div>
     <div id="detail-head"></div>
+    <div id="detail-actions" class="actions" hidden>
+      <div class="action-row">
+        <button id="act-resume" type="button" class="act">Resume plan</button>
+        <button id="act-done" type="button" class="act">Done</button>
+        <button id="act-discard" type="button" class="act danger">Discard</button>
+      </div>
+      <div id="discard-confirm" class="confirm" hidden>
+        <label for="discard-word">Discarding removes the worktree, workspace and local branch with no checks: uncommitted and unpushed work is lost. Type <b>discard</b> to go ahead.</label>
+        <div class="action-row">
+          <input id="discard-word" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" enterkeyhint="go">
+          <button id="discard-go" type="button" class="act danger" disabled>Discard it</button>
+        </div>
+      </div>
+      <pre id="act-result" class="result" role="status" aria-live="polite" hidden></pre>
+    </div>
     <div class="tabs" role="tablist" aria-label="Stream detail">
       <button type="button" role="tab" data-what="progress" aria-selected="true">Progress</button>
       <button type="button" role="tab" data-what="diff" aria-selected="false">Diff</button>
@@ -55,6 +70,60 @@
     <pre id="tab-text" class="text" role="tabpanel"></pre>
   </section>
 </main>
+
+<button id="new" type="button" class="fab" aria-haspopup="dialog" hidden>+ New</button>
+
+<div id="sheet" class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title" hidden>
+  <div class="sheet-inner">
+    <div class="sheet-bar">
+      <h2 id="sheet-title">New</h2>
+      <button id="sheet-close" type="button" class="back" aria-label="Close">Close</button>
+    </div>
+    <div class="tabs three" role="tablist" aria-label="What to start">
+      <button type="button" role="tab" data-form="task" aria-selected="true">Task</button>
+      <button type="button" role="tab" data-form="draft" aria-selected="false">Draft</button>
+      <button type="button" role="tab" data-form="plan" aria-selected="false">Plan</button>
+    </div>
+
+    <form id="f-task" class="form" data-form="task" autocomplete="off">
+      <label>Repo <select name="repo" class="repo-pick" required></select></label>
+      <label>Prompt <textarea name="prompt" rows="8" required placeholder="Fix the flaky login test. Run make test, open a PR labelled review-me."></textarea></label>
+      <div id="recent" class="recent" hidden>
+        <p class="recent-title">Recent</p>
+        <div id="recent-list" class="recent-list"></div>
+      </div>
+      <label>Branch <input name="branch" type="text" required autocapitalize="none" spellcheck="false" placeholder="fix/flaky-login"></label>
+      <label>Persona <select name="persona" class="persona-pick"></select></label>
+      <button type="submit" class="go">Start the agent</button>
+      <pre class="result" role="status" aria-live="polite" hidden></pre>
+    </form>
+
+    <form id="f-draft" class="form" data-form="draft" autocomplete="off" hidden>
+      <label>Repo <select name="repo" class="repo-pick" required></select></label>
+      <label>Goal <textarea name="goal" rows="8" required placeholder="Add CSV export to the reports page, with tests and docs."></textarea></label>
+      <p class="hint">A read-only agent reads the repo and splits the goal into parallel tasks, one line each. It takes a minute or two.</p>
+      <button type="submit" class="go">Draft the tasks</button>
+      <pre class="result" role="status" aria-live="polite" hidden></pre>
+      <div class="drafted" hidden>
+        <p class="recent-title">Drafted <span class="drafted-file"></span></p>
+        <pre class="text drafted-text"></pre>
+        <button type="button" class="go fanout">Fan out</button>
+        <pre class="result fanout-result" role="status" aria-live="polite" hidden></pre>
+      </div>
+    </form>
+
+    <form id="f-plan" class="form" data-form="plan" autocomplete="off" hidden>
+      <label>Repo <select name="repo" class="repo-pick" required></select></label>
+      <label>Branch <input name="branch" type="text" required autocapitalize="none" spellcheck="false" placeholder="feat/export-csv"></label>
+      <label>Plan <textarea name="plan_text" rows="10" required placeholder="What to build, in as much detail as you have. Optional: ## Stage 1: title headings."></textarea></label>
+      <label>Verify <input name="verify" type="text" autocapitalize="none" spellcheck="false" placeholder="make test (for stages without their own)"></label>
+      <label>Persona <select name="persona" class="persona-pick"></select></label>
+      <p class="hint">The plan runs in a new herdr tab on the computer, stage by stage, and ends in one PR.</p>
+      <button type="submit" class="go">Start the plan</button>
+      <pre class="result" role="status" aria-live="polite" hidden></pre>
+    </form>
+  </div>
+</div>
 
 <footer class="foot">
   <button id="forget" type="button" class="forget" hidden>Forget this device</button>

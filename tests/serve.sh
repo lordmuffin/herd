@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Tests for herd serve (serve/herd_serve.py, started through `herd serve`): tokens, auth, the
-# Host check, the snapshot and show routes, the event stream and a clean SIGTERM. The server runs
-# on a free port against a temp repo and the same faked herdr as tests/status.sh; curl is the
-# client.
+# Host check, the snapshot and show routes, the event stream, the write routes and a clean
+# SIGTERM. The server runs on a free port against a temp repo and the same faked herdr as
+# tests/status.sh; curl is the client. The write routes run a fake herd that only logs what it
+# was asked to do, so no agent ever starts.
 #
 #   bash tests/serve.sh        (make test runs it)
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -42,6 +43,7 @@ case "\$1 \$2" in
   "worktree list") cat "$T/wt.json" ;;
   "agent list") cat "$T/agents.json" ;;
   "agent read") printf 'Allow edit of src/x.rs?\n' ;;
+  "plugin pane") printf '%s\n' "\$*" >>"$T/herdr.calls" ;;
   *) exit 1 ;;
 esac
 EOF
@@ -110,7 +112,9 @@ check "?t= is not accepted outside /api/events" test "$code" = 401
 get /api/nope -H "Authorization: Bearer $reader"
 check "an unknown /api route is 404" test "$code" = 404
 get /api/snapshot -X POST -H "Authorization: Bearer $controller"
-check "no write routes yet: POST is 405" test "$code" = 405
+check "POST to a read route is 404" test "$code" = 404
+get /api/snapshot -X PUT -H "Authorization: Bearer $controller"
+check "PUT is 405" test "$code" = 405
 
 echo "Host check"
 get /api/snapshot -H "Authorization: Bearer $reader" -H "Host: evil.example:$port"
@@ -177,7 +181,10 @@ echo "config"
 get /api/config
 check "/api/config needs a token" test "$code" = 401
 get /api/config -H "Authorization: Bearer $reader"
-check "/api/config holds only the relay settings" jqt 'keys == ["relay_app_url", "relay_host"]'
+check "/api/config holds only the relay and write settings" jqt 'keys == ["read_only", "relay_app_url", "relay_host", "repos", "role"]'
+check "...and which token this is" jqt '.role == "reader" and .read_only == false'
+get /api/config -H "Authorization: Bearer $controller"
+check "...the controller's too" jqt '.role == "controller"'
 check "...with no app URL when herd.conf sets none" jqt '.relay_app_url == null and (.relay_host | length > 0)'
 check "...and no token" bash -c "! grep -qF -e '$reader' -e '$controller' '$T/out'"
 
@@ -211,17 +218,237 @@ printf 'HERD_BASE=main\nHERD_RELAY_APP_URL=https://relay.example/app/\nHERD_RELA
 start
 get /api/config -H "Authorization: Bearer $reader"
 check "HERD_RELAY_APP_URL and HERD_RELAY_HOST reach /api/config" \
-  jqt '. == {"relay_app_url": "https://relay.example/app/", "relay_host": "lap"}'
+  jqt '.relay_app_url == "https://relay.example/app/" and .relay_host == "lap"'
 check "...and nothing secret does" bash -c "! grep -qF -e '$reader' -e '$controller' '$T/out'"
 get /api/snapshot -H "Authorization: Bearer $reader"
 check "the streams carry the same host" jqt '.repos[0].streams[0].host == "lap"'
 stop
 printf 'HERD_BASE=main\n' >"$HERD_CONF"
 
-echo "listen"
+# --- writes -----------------------------------------------------------------------------------------
+routes=(start draft fanout plan plan-resume "done" rm)
+# post <route[?query]> <json> [curl args]: POST JSON, with the token $AS (default: the
+# controller's; "-" sends none) and the Content-Type $CT (default application/json).
+post() {
+  local p=$1 body=$2 tok=${AS:-$controller}; shift 2
+  [[ $tok == - ]] && tok=""
+  code=$(curl -s -o "$T/out" -D "$T/headers" -w '%{http_code}' --max-time 20 -X POST \
+    -H "Content-Type: ${CT:-application/json}" ${tok:+-H "Authorization: Bearer $tok"} "$@" \
+    --data-binary "$body" "http://127.0.0.1:$port/api/$p")
+}
+# js k=v ...: a JSON object of string fields, built by jq so nothing needs quoting by hand.
+js() {
+  local args=() k
+  for k in "$@"; do args+=(--arg "${k%%=*}" "${k#*=}"); done
+  jq -cn "${args[@]}" '$ARGS.named'
+}
+
+echo "writes: who may"
+start
+allowed=1
+for r in "${routes[@]}"; do
+  AS=$reader post "$r" "$(js repo="$repo")"
+  [[ $code == 403 ]] || { allowed=0; echo "  $r: $code"; }
+done
+check "the reader token gets 403 on every POST route" test "$allowed" = 1
+AS=- post start '{}'
+check "no token is 401" test "$code" = 401
+post start "$(js repo="$repo")" -H "Host: evil.example"
+check "a foreign Host is rejected on POST too" test "$code" = 403
+post nope '{}'
+check "an unknown POST route is 404" test "$code" = 404
+post start "$(js repo="$repo" prompt="$(head -c 70000 /dev/zero | tr '\0' x)")"
+check "a body over 64 KB is 413" test "$code" = 413
+CT=text/plain post start "$(js repo="$repo")"
+check "a body that's not application/json is 415" test "$code" = 415
+post start '[1]'
+check "a body that's not a JSON object is 400" test "$code" = 400
+stop
+
 start --read-only; rc=$?
 check "--read-only starts and says so" bash -c "test $rc = 0 && grep -q read-only '$T/log'"
+allowed=1
+for r in "${routes[@]}"; do
+  post "$r" "$(js repo="$repo")"
+  [[ $code == 405 || $code == 403 ]] || { allowed=0; echo "  $r: $code"; }
+done
+check "--read-only turns every POST route off, also for the controller" test "$allowed" = 1
+get /api/config -H "Authorization: Bearer $reader"
+check "...and /api/config says so" jqt '.read_only == true'
 stop
+
+# The write routes against a fake herd: status, show and personas are the real bin/herd; anything
+# else logs its argv (one line, args joined by |) and prints what herd would.
+cat >"$T/fakeherd" <<EOF
+#!/usr/bin/env bash
+case \$1 in status|show|personas) exec bash "$herd" "\$@" ;; esac
+(IFS='|'; echo "\$*") >>"$T/herd.calls"
+out="" dry=""
+while ((\$#)); do
+  case \$1 in -o) out=\$2; shift 2 ;; -n) dry=1; shift ;; *) shift ;; esac
+done
+if [[ -n \$out ]]; then
+  cat >"$T/draft.stdin"; printf 'feat/d @engineer: Do the thing.\n' >"\$out"; echo "wrote \$out"; exit 0
+fi
+if [[ -n \$dry ]]; then echo "feat/d  feat-d  engineer  Do the thing...."; exit 0; fi
+echo "started feat-d"
+EOF
+calls() { cat "$T/herd.calls" 2>/dev/null; }
+last_call() { tail -1 "$T/herd.calls" 2>/dev/null; }
+git init -q -b main "$T/other" && git -C "$T/other" commit -q --allow-empty -m init
+fstart() {
+  port=$(free_port)
+  python3 "$root/serve/herd_serve.py" --port "$port" --state-dir "$state" --web "$root/web" --base main \
+    --plugin "$root/plugin/herd-plugin.sh" --repos "$T/other" --agent-arg=--permission-mode --agent-arg=auto \
+    --herd bash "$T/fakeherd" >"$T/log" 2>&1 &
+  pid=$!
+  local i
+  for ((i = 0; i < 100; i++)); do
+    curl -fs "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 && return 0
+    sleep 0.1
+  done
+  return 1
+}
+rm -f "$state/serve-audit.jsonl"
+check "the server starts with a fake herd" fstart
+audit=$state/serve-audit.jsonl
+
+echo "writes: start"
+get "/api/personas?repo=$repo" -H "Authorization: Bearer $reader"
+check "/api/personas lists herd personas" jqt '[.personas[].name] | index("engineer")'
+check "...without their file paths" bash -c "! grep -q '\\.md' '$T/out'"
+secret="Fix the SECRET-PROMPT-7f3a thing; run make test."
+post start "$(js repo="$repo" branch=feat/new persona=engineer prompt="$secret")"
+check "POST /api/start runs herd with the task" bash -c "test $code = 200 && jq -e '.ok == true and (.output | contains(\"started\"))' '$T/out' >/dev/null"
+check "...as herd -r <repo> -b <base> -k <kind> -P <persona> <branch> <prompt> -- <agent args>" \
+  test "$(last_call)" = "-r|$repo|-b|main|-k|claude|-P|engineer|feat/new|$secret|--|--permission-mode|auto"
+rid=$(jq -r .request_id "$T/out")
+check "...with a request id, in the body and a header" \
+  bash -c "[[ $rid =~ ^[0-9a-f]{16}\$ ]] && grep -qi '^x-request-id: $rid' '$T/headers'"
+n=$(calls | wc -l)
+post start "$(js repo="$repo" branch=feat/a prompt=x)"
+check "a branch that exists is refused (409)" test "$code" = 409
+bad_branches=1
+for b in "bad branch" "-x" "a..b" "fix @eng" "x:y" "/abs" ""; do
+  post start "$(js repo="$repo" branch="$b" prompt=x)"
+  [[ $code == 400 ]] || { bad_branches=0; echo "  '$b': $code"; }
+done
+check "invalid branch names are 400" test "$bad_branches" = 1
+post start "$(js repo="$repo" branch=feat/b persona=nobody-at-all prompt=x)"
+check "an unknown persona is 400" bash -c "test $code = 400 && jq -e '.error | contains(\"persona\")' '$T/out' >/dev/null"
+post start "$(js repo="$T" branch=feat/b prompt=x)"
+check "a repo herd serve doesn't know is 404" test "$code" = 404
+post start "$(js repo="$repo" branch=feat/b prompt="  ")"
+check "an empty prompt is 400" test "$code" = 400
+check "...and none of those ran herd" test "$(calls | wc -l)" = "$n"
+post start "$(js repo="$T/other" branch=feat/b persona=none prompt=x)"
+check "a HERD_SERVE_REPOS repo with no streams yet is allowed, and persona none (bare)" \
+  bash -c "test $code = 200 && [[ '$(last_call)' == '-r|$T/other|-b|main|-k|claude|-P|none|feat/b|x|--|'* ]]"
+
+echo "writes: the audit log"
+check "every POST leaves one line in serve-audit.jsonl" test "$(wc -l <"$audit")" = 13
+check "...each with ts, token_role, route, repo, branch, ok and a request id" \
+  bash -c "jq -se 'all(has(\"ts\") and has(\"token_role\") and has(\"route\") and has(\"repo\") and has(\"branch\") and has(\"ok\") and has(\"request_id\"))' '$audit' >/dev/null"
+check "...the start's: controller, its repo and branch, ok, the request id" \
+  bash -c "head -1 '$audit' | jq -e '.token_role == \"controller\" and .route == \"/api/start\" and .repo == \"$repo\" and .branch == \"feat/new\" and .ok == true and .request_id == \"$rid\"' >/dev/null"
+sha=$(printf '%s' "$secret" | sha256sum | cut -d' ' -f1)
+check "...the prompt only as its length and sha256" \
+  bash -c "head -1 '$audit' | jq -e '.prompt_len == ${#secret} and .prompt_sha256 == \"$sha\"' >/dev/null"
+check "the prompt text is in neither the audit log nor the server log" \
+  bash -c "! grep -qF SECRET-PROMPT '$audit' '$T/log'"
+check "the audit log is mode 0600" test "$(stat -c %a "$audit" 2>/dev/null || stat -f %Lp "$audit")" = 600
+
+echo "writes: draft"
+n=$(calls | wc -l)
+escapes=1
+for o in "../Tasks.herd" "/tmp/Tasks.herd" "sub/Tasks.herd" "Notes.herd" "Tasks.md" ".Tasks.herd" "Tasks.herd/../../x.herd"; do
+  post draft "$(js repo="$repo" goal=g output="$o")"
+  [[ $code == 400 ]] || { escapes=0; echo "  '$o': $code"; }
+done
+check "draft's output must be a Tasks*.herd in the repo root" test "$escapes" = 1
+ln -s "$T/elsewhere.herd" "$repo/Tasks-link.herd"
+post draft "$(js repo="$repo" goal=g output=Tasks-link.herd)"
+check "...and not a symlink out of it" test "$code" = 400
+check "...and none of those ran herd" test "$(calls | wc -l)" = "$n"
+post draft "$(js repo="$repo" goal="Split the GOAL-TEXT-9c work" output=Tasks-x.herd)"
+check "POST /api/draft runs herd draft -o <output>, the goal on stdin" \
+  bash -c "test $code = 200 && [[ \"\$(sed -n '$((n + 1))p' '$T/herd.calls')\" == 'draft|-r|$repo|-b|main|-o|$repo/Tasks-x.herd|-' ]] && grep -q GOAL-TEXT '$T/draft.stdin'"
+check "...and returns the saved file, its dry run and a fan-out hash" \
+  jqt '.ok and .file == "Tasks-x.herd" and (.text | contains("feat/d @engineer")) and (.dry_run | contains("feat-d")) and (.hash | length == 64)'
+check "...its dry run being herd -n -f <file>" test "$(last_call)" = "-n|-r|$repo|-f|$repo/Tasks-x.herd"
+draft_hash=$(jq -r .hash "$T/out")
+post draft "$(js repo="$repo" goal=g output=Tasks-x.herd)"
+check "a draft over an existing file is 409" test "$code" = 409
+check "the goal is not in the audit log" bash -c "! grep -qF GOAL-TEXT '$audit'"
+
+echo "writes: fan out"
+n=$(calls | wc -l)
+escapes=1
+for f in "../x.herd" "$repo/Tasks-x.herd" "sub/x.herd" "Tasks-x.md" "Tasks-link.herd"; do
+  post fanout "$(js repo="$repo" file="$f")"
+  [[ $code == 400 ]] || { escapes=0; echo "  '$f': $code"; }
+done
+check "fanout's file must be a *.herd in the repo root" test "$escapes" = 1
+post fanout "$(js repo="$repo" file=Tasks-x.herd)"
+check "a fan-out with no preview hash is refused (409)" test "$code" = 409
+post fanout "$(js repo="$repo" file=Tasks-x.herd hash="$(printf '0%.0s' {1..64})")"
+check "...and so is one with a made-up hash" test "$code" = 409
+check "...and neither started anything" test "$(calls | wc -l)" = "$n"
+post "fanout?dry=1" "$(js repo="$repo" file=Tasks-x.herd)"
+check "?dry=1 runs herd -n and returns the batch's hash" \
+  bash -c "test $code = 200 && [[ '$(last_call)' == '-n|-r|$repo|-f|$repo/Tasks-x.herd' ]] && jq -e '.hash | length == 64' '$T/out' >/dev/null"
+hash=$(jq -r .hash "$T/out")
+check "...the same hash the draft gave" test "$hash" = "$draft_hash"
+echo "feat/e @engineer: Another thing." >>"$repo/Tasks-x.herd"
+post fanout "$(js repo="$repo" file=Tasks-x.herd hash="$hash")"
+check "the hash of a preview from before an edit is stale (409)" test "$code" = 409
+post "fanout?dry=1" "$(js repo="$repo" file=Tasks-x.herd)"
+hash=$(jq -r .hash "$T/out")
+post fanout "$(js repo="$repo" file=Tasks-x.herd hash="$hash")"
+check "a fresh preview's hash starts the batch: herd -r <repo> -b -k -f <file> -- <agent args>" \
+  bash -c "test $code = 200 && [[ '$(last_call)' == '-r|$repo|-b|main|-k|claude|-f|$repo/Tasks-x.herd|--|--permission-mode|auto' ]]"
+post fanout "$(js repo="$repo" file=Tasks-x.herd hash="$hash")"
+check "...once: the same hash again is refused" test "$code" = 409
+
+echo "writes: plan"
+: >"$T/herdr.calls"
+post plan "$(js repo="$repo" branch=feat/plan plan_text=$'## Stage 1: one\n\nDo PLAN-TEXT-4d one thing.' verify="make test" persona=engineer)"
+check "POST /api/plan writes the plan to .herd/inbox/<branch>.md" \
+  bash -c "test $code = 200 && grep -q PLAN-TEXT '$repo/.herd/inbox/feat/plan.md'"
+check "...keeps .herd/inbox out of git status" \
+  bash -c "grep -qx '/.herd/inbox/' '$repo/.git/info/exclude' && ! git -C '$repo' status --porcelain | grep -q herd/"
+check "...and opens the plugin's plan pane in a herdr tab of the repo's workspace, with the form" \
+  bash -c "grep -q -- '--entrypoint plan .*--env HERD_REPO=$repo --env HERD_BRANCH=feat/plan --env HERD_PLAN_FILE=$repo/.herd/inbox/feat/plan.md --env HERD_PLAN_VERIFY=make test --env HERD_PLAN_PERSONA=engineer --workspace w1' '$T/herdr.calls'"
+check "...not as a child of the server: herd plan never ran here" bash -c "! grep -q '^plan' '$T/herd.calls'"
+check "the plan text is not in the audit log, only its length and sha256" \
+  bash -c "! grep -qF PLAN-TEXT '$audit' && tail -1 '$audit' | jq -e '.plan_len > 0 and (.plan_sha256 | length == 64)' >/dev/null"
+post plan-resume "$(js repo="$repo" branch=feat/a)"
+check "plan-resume of a stream with no plan is 409" test "$code" = 409
+mkdir -p "$wt/.herd/run"; printf 'stage=1\nstatus=blocked\n' >"$wt/.herd/run/state"; touch "$state/serve.nudge"
+: >"$T/herdr.calls"
+post plan-resume "$(js repo="$repo" branch=feat/a)"
+check "POST /api/plan-resume opens the plugin's plan-resume pane for that branch" \
+  bash -c "test $code = 200 && grep -q -- '--entrypoint plan-resume .*--env HERD_BRANCH=feat/a --workspace w1' '$T/herdr.calls'"
+
+echo "writes: done, rm"
+post "done" "$(jq -cn --arg r "$repo" '{repo: $r, branches: ["feat/a"]}')"
+check "POST /api/done runs herd done -r <repo> -b <base> <branches>" \
+  bash -c "test $code = 200 && [[ '$(last_call)' == 'done|-r|$repo|-b|main|feat/a' ]]"
+post "done" "$(jq -cn --arg r "$repo" '{repo: $r, branches: ["main"]}')"
+check "...only for streams of the snapshot" test "$code" = 404
+post rm "$(jq -cn --arg r "$repo" '{repo: $r, branches: ["feat/a"]}')"
+check "POST /api/rm without confirm: discard is 400" test "$code" = 400
+post rm "$(jq -cn --arg r "$repo" '{repo: $r, branches: ["feat/a"], confirm: "yes"}')"
+check "...and so is any other confirm" test "$code" = 400
+post rm "$(jq -cn --arg r "$repo" '{repo: $r, branches: ["feat/a"], confirm: "discard"}')"
+check "with it, herd rm -r <repo> <branches> runs" \
+  bash -c "test $code = 200 && [[ '$(last_call)' == 'rm|-r|$repo|feat/a' ]]"
+check "the audit line of a list of branches lists them" \
+  bash -c "tail -1 '$audit' | jq -e '.branch == [\"feat/a\"] and .route == \"/api/rm\"' >/dev/null"
+stop
+rm -rf "$wt/.herd"
+
+echo "listen"
 printf 'HERD_BASE=main\nHERD_SERVE_LISTEN=0.0.0.0\n' >"$HERD_CONF"
 "$herd" serve --port "$(free_port)" >"$T/log" 2>&1; rc=$?
 check "a non-loopback HERD_SERVE_LISTEN alone is refused" bash -c "test $rc != 0 && grep -q 'pass --listen' '$T/log'"
