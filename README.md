@@ -11,6 +11,8 @@ herd draft "Add CSV export and document it"                # write Tasks.herd fr
 herd -n                                                    # dry run: what would start, and as what
 herd ls                                                    # agents and their status
 herd status                                                # this repo's streams, with plan stages
+herd status -j -a                                          # every repo's streams, as JSON (docs/serve-api.md)
+herd show -j . fix/foo diff                                # one stream's diff|log|progress|screen, as JSON
 herd done fix/foo                                          # after merge: remove worktree + branches
 herd done                                                  # close the whole Tasks.herd batch
 herd rm fix/foo                                            # discard a stream (no checks)

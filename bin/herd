@@ -24,8 +24,14 @@
 #                                     # per parallel task; herd checks every line before it saves
 #                                     # Tasks.herd (or -o file, "-" for stdout; -F overwrites)
 #   herd ls                           # agents + their status
-#   herd status [-j] [-r repo]        # this repo's streams: branch, agent, status, plan stage
-#                                     # (-j: one JSON object per stream)
+#   herd status [-j] [-a] [-b ref] [-r repo]
+#                                     # this repo's streams: branch, agent, status, plan stage
+#                                     # (-j: one JSON object per stream, with git facts and plan
+#                                     # stages; -a: every repo with streams under ~/git/wt, as one
+#                                     # JSON document with -j; see docs/serve-api.md)
+#   herd show [-j] [-b ref] <repo> <branch> diff|progress|screen|log
+#                                     # one stream's diff or log against the base, its
+#                                     # PROGRESS.md or its agent's screen (-j: {text, truncated})
 #   herd version                      # print the version (also --version, -V)
 #   herd personas [<name>]            # list personas, or print one as a ready-to-paste prompt
 #   herd rm [-f file] <branch|name>...        # remove worktree, workspace and local branch
@@ -744,33 +750,167 @@ plan_label() {
   if [[ ${s:-0} == 0 ]]; then echo "$st"; else echo "stage $s/$n $st"; fi
 }
 
-# herd's streams in $repo — the linked worktrees under ~/git/wt/<repo>/ — with each one's agent,
-# its status and, for a plan, where it is. -j prints one JSON object per stream instead.
-cmd_status() {
-  [[ -n $repo ]] || repo=$(git rev-parse --show-toplevel)
-  local wts agents path branch ws name st plan rows="" main
-  # Streams are named after the main checkout, also when this runs in one of its worktrees.
-  main=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir) || die "$repo is not a git repo"
-  [[ $(basename "$main") == .git ]] && main=$(dirname "$main")
-  wts=$(h worktree list --cwd "$repo") || die "could not list worktrees of $repo"
-  agents=$(h agent list 2>/dev/null) || agents='{"result":{"agents":[]}}'
-  while IFS=$'\t' read -r path branch ws; do
-    name=$(agent_name "$branch")
-    st=$(jq -r --arg p "$path" '[.result.agents[] | select(.cwd == $p or (.cwd | startswith($p + "/")))
-           | .agent_status][0] // "-"' <<<"$agents")
-    plan=$(plan_label "$path")
-    if ((json)); then
-      jq -cn --arg b "$branch" --arg a "$name" --arg s "$st" --arg pl "$plan" --arg p "$path" --arg w "$ws" \
-        '{branch: $b, agent: $a, status: $s, plan: $pl, path: $p, workspace: $w}'
-    else
-      rows+=$(printf '%s\t%s\t%s\t%s\t%s' "$branch" "$name" "$st" "${plan:--}" "$ws")$'\n'
+# A plan's stages and where it stopped, from <worktree>/.herd/run, as JSON: {status, stages: [{n,
+# title, state}], stopped_reason}, state being done, current, stopped (blocked, failed, or a
+# "STOPPED:" line in PROGRESS.md) or todo. null when the stream has no plan run.
+plan_json() {
+  local r=$1/.herd/run s="" st="" titles="" stop=""
+  [[ -f $r/state ]] || { echo null; return; }
+  s=$(sed -n 's/^stage=//p' "$r/state") st=$(sed -n 's/^status=//p' "$r/state")
+  [[ -f $r/stages.md ]] && titles=$(sed -n 's/^## Stage [0-9][0-9]*:\{0,1\}[[:space:]]*//p' "$r/stages.md")
+  stop=$(grep -m1 '^STOPPED:' "$r/PROGRESS.md" 2>/dev/null) && stop=$(sed 's/^STOPPED:[[:space:]]*//' <<<"$stop")
+  jq -cn --arg s "$s" --arg st "$st" --arg t "$titles" --arg stop "$stop" '
+    ($s | tonumber? // 0) as $cur
+    | {status: (if $st == "" then null else $st end),
+       stages: [$t | if . == "" then [] else split("\n") end | to_entries[] | (.key + 1) as $n
+         | {n: $n, title: .value,
+            state: (if $st == "complete" or $n < $cur then "done"
+                    elif $n == $cur then
+                      (if $st == "verified" then "done"
+                       elif $st == "blocked" or $st == "failed" or $stop != "" then "stopped"
+                       else "current" end)
+                    else "todo" end)}],
+       stopped_reason: (if $stop != "" then $stop
+                        elif $st == "blocked" then "blocked: the agent is waiting for an answer in its pane"
+                        elif $st == "failed" then "failed: the stage still fails its gate after a fix-up turn"
+                        else null end)}'
+}
+
+# git facts for a worktree, as JSON: {ahead (commits ahead of $base), dirty (uncommitted files),
+# last_commit: {sha, subject, rel_time}}. Each is null where git can't say (worktree gone, base
+# unknown, no commits).
+stream_git_json() {
+  local p=$1 ahead="" dirty="" s last=""
+  if [[ -d $p ]]; then
+    ahead=$(git -C "$p" rev-list --count "$base..HEAD" 2>/dev/null) || ahead=""
+    if s=$(git -C "$p" status --porcelain 2>/dev/null); then
+      dirty=0; [[ -z $s ]] || dirty=$(($(wc -l <<<"$s")))
     fi
-  done < <(jq -r --arg pre "$HOME/git/wt/$(basename "$main")/" '.result.worktrees[]
-             | select(.is_linked_worktree and (.path | startswith($pre)))
-             | [.path, .branch // "-", .open_workspace_id // "-"] | @tsv' <<<"$wts")
+    last=$(git -C "$p" log -1 --format='%h%x09%cr%x09%s' 2>/dev/null) || last=""
+  fi
+  jq -cn --arg a "$ahead" --arg d "$dirty" --arg l "$last" '
+    {ahead: ($a | tonumber? // null), dirty: ($d | tonumber? // null),
+     last_commit: (if $l == "" then null
+                   else $l | split("\t") | {sha: .[0], subject: (.[2:] | join("\t")), rel_time: .[1]} end)}'
+}
+
+# The host name the web page shows and the relay deep link carries: HERD_RELAY_HOST, else hostname -s.
+herd_host() { echo "${HERD_RELAY_HOST:-$(hostname -s 2>/dev/null || uname -n)}"; }
+
+# Sets main (the main checkout of $repo) and stream_tsv: herd's streams in it, the linked
+# worktrees under ~/git/wt/<repo>/, one "path\tbranch\tworkspace" line each. Fails with a message.
+load_streams() {
+  local wts
+  stream_tsv=""
+  # Streams are named after the main checkout, also when this runs in one of its worktrees.
+  main=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+    || { echo "herd: $repo is not a git repo" >&2; return 1; }
+  [[ $(basename "$main") == .git ]] && main=$(dirname "$main")
+  wts=$(h worktree list --cwd "$repo") || { echo "herd: could not list worktrees of $repo" >&2; return 1; }
+  stream_tsv=$(jq -r --arg pre "$HOME/git/wt/$(basename "$main")/" '.result.worktrees[]
+                 | select(.is_linked_worktree and (.path | startswith($pre)))
+                 | [.path, .branch // "-", .open_workspace_id // "-"] | @tsv' <<<"$wts")
+}
+
+# `h agent list`, once per run; an unreachable herdr counts as no agents.
+load_agents() {
+  [[ -n ${agents:-} ]] || agents=$(h agent list 2>/dev/null) || agents='{"result":{"agents":[]}}'
+}
+
+# The agent running in worktree $1 (or a directory under it), as agent-list JSON, or null.
+stream_agent() {
+  jq -c --arg p "$1" '[.result.agents[] | select(.cwd == $p or (.cwd | startswith($p + "/")))][0] // null' <<<"$agents"
+}
+
+# One stream as a JSON object. The first six fields are the original `status -j` ones, in their
+# original order; docs/serve-api.md has the whole contract.
+stream_json() {
+  local path=$1 branch=$2 ws=$3
+  jq -cn --arg b "$branch" --arg a "$(agent_name "$branch")" --arg pl "$(plan_label "$path")" \
+    --arg p "$path" --arg w "$ws" --arg host "$host" --argjson ag "$(stream_agent "$path")" \
+    --argjson git "$(stream_git_json "$path")" --argjson pd "$(plan_json "$path")" '
+    {branch: $b, agent: $a, status: ($ag.agent_status // "-"), plan: $pl, path: $p, workspace: $w,
+     pane_id: ($ag.pane_id // null), host: $host} + $git + {plan_detail: $pd}'
+}
+
+# herd's streams in $repo, with each one's agent, its status and, for a plan, where it is. -j
+# prints one JSON object per stream instead.
+cmd_status() { load_streams || exit 1; print_streams; }
+
+# cmd_status for the streams load_streams found.
+print_streams() {
+  local path branch ws st pl rows="" host
+  load_agents
+  host=$(herd_host)
+  while IFS=$'\t' read -r path branch ws; do
+    [[ -n $path ]] || continue
+    if ((json)); then stream_json "$path" "$branch" "$ws"; continue; fi
+    st=$(stream_agent "$path" | jq -r '.agent_status // "-"')
+    pl=$(plan_label "$path")
+    rows+=$(printf '%s\t%s\t%s\t%s\t%s' "$branch" "$(agent_name "$branch")" "$st" "${pl:--}" "$ws")$'\n'
+  done <<<"$stream_tsv"
   ((json)) && return
   if [[ -z $rows ]]; then echo "no herd streams in $repo"; return; fi
   { printf 'BRANCH\tAGENT\tSTATUS\tPLAN\tWORKSPACE\n'; printf '%s' "$rows"; } | column -t -s $'\t'
+}
+
+# Every main checkout with streams under ~/git/wt/<repo>/, found by mapping each worktree there
+# back to its checkout. -j prints one document: {generated_at, host, repos: [{repo, path,
+# streams}]}, blocked streams first in each repo.
+cmd_status_all() {
+  local d common m host out mains=()
+  for d in "$HOME"/git/wt/*/*/; do
+    common=$(git -C "$d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || continue
+    [[ $(basename "$common") == .git ]] && common=$(dirname "$common")
+    mains+=("$common")
+  done
+  load_agents
+  host=$(herd_host)
+  while IFS= read -r m; do
+    [[ -n $m ]] || continue
+    repo=$m
+    load_streams || continue
+    [[ -n $stream_tsv ]] || continue
+    if ! ((json)); then echo "== $(basename "$m")  ($m)"; print_streams; echo; continue; fi
+    out=$(print_streams) || continue
+    jq -cs --arg r "$(basename "$m")" --arg p "$m" \
+      '{repo: $r, path: $p, streams: (map(select(.status == "blocked")) + map(select(.status != "blocked")))}' <<<"$out"
+  done < <(if ((${#mains[@]})); then printf '%s\n' "${mains[@]}" | sort -u; fi) |
+    if ((json)); then
+      jq -s --arg g "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg h "$host" '{generated_at: $g, host: $h, repos: .}'
+    else cat; fi
+}
+
+# One stream's diff, log, progress or agent screen. -j wraps it as {text, truncated}; either way
+# the text stops at 200 KB.
+cmd_show() {
+  local want=$1 what=$2 limit=204800 path="" p b w tmp truncated=false ag target
+  case $what in diff|progress|screen|log) ;; *) die "show: what must be diff, progress, screen or log, not '$what'" ;; esac
+  load_streams || exit 1
+  while IFS=$'\t' read -r p b w; do
+    [[ -n $p && $b == "$want" ]] && { path=$p; break; }
+  done <<<"$stream_tsv"
+  [[ -n $path ]] || die "$want is not a herd stream of $main"
+  tmp=$(mktemp "${TMPDIR:-/tmp}/herd-show.XXXXXX")
+  # shellcheck disable=SC2064  # expand $tmp now
+  trap "rm -f '$tmp' '$tmp.cut'" EXIT
+  case $what in
+    diff) git -C "$path" diff "$base" >"$tmp" || die "could not diff $want against $base" ;;
+    log) git -C "$path" log --oneline "$base..HEAD" >"$tmp" || die "could not read $want's log against $base" ;;
+    progress) [[ ! -f $path/.herd/run/PROGRESS.md ]] || cat "$path/.herd/run/PROGRESS.md" >"$tmp" ;;
+    screen)
+      load_agents; ag=$(stream_agent "$path")
+      target=$(jq -r '.pane_id // .name // empty' <<<"$ag")
+      if [[ -n $target ]]; then
+        h agent read "$target" --source recent-unwrapped --lines 200 >"$tmp" 2>/dev/null \
+          || die "could not read the screen of $want's agent"
+      fi ;;
+  esac
+  if (($(wc -c <"$tmp") > limit)); then
+    truncated=true; head -c "$limit" "$tmp" >"$tmp.cut"; mv "$tmp.cut" "$tmp"
+  fi
+  if ((json)); then jq -n --rawfile t "$tmp" --argjson tr "$truncated" '{text: $t, truncated: $tr}'
+  else cat "$tmp"; fi
 }
 
 # Sourced (by tests/plan.sh): define the functions above, run nothing.
@@ -909,8 +1049,16 @@ cmd_draft() {
 case ${1:-} in
   version|--version|-V) cmd_version; exit ;;
   ls) shift; cmd_ls; exit ;;
-  status) shift; json=0; while getopts "r:j" o; do case $o in r) repo=$OPTARG;; j) json=1;; *) exit 2;; esac; done
+  status) shift; json=0 all=0
+      while getopts "r:b:ja" o; do case $o in r) repo=$OPTARG;; b) base=$OPTARG;; j) json=1;; a) all=1;; *) exit 2;; esac; done
+      shift $((OPTIND-1)); [[ $# -eq 0 ]] || die "status takes no arguments, only options"
+      if ((all)); then cmd_status_all; exit; fi
       repo=${repo:-$(git rev-parse --show-toplevel)}; repo=$(cd "$repo" && git rev-parse --show-toplevel); cmd_status; exit ;;
+  show) shift; json=0
+      while getopts "b:j" o; do case $o in b) base=$OPTARG;; j) json=1;; *) exit 2;; esac; done
+      shift $((OPTIND-1)); [[ $# -eq 3 ]] || die "show needs <repo-path> <branch> diff|progress|screen|log"
+      [[ -d $1 ]] || die "no such repo: $1"
+      repo=$(cd "$1" && git rev-parse --show-toplevel) || die "$1 is not a git repo"; cmd_show "$2" "$3"; exit ;;
   personas) shift; [[ $# -le 1 ]] || die "personas takes at most one name"
       repo=$(git rev-parse --show-toplevel 2>/dev/null || true); cmd_personas "$@"; exit ;;
   "done") shift; while getopts "r:b:Ff:" o; do case $o in r) repo=$OPTARG;; b) base=$OPTARG;; F) force=1;; f) file=$OPTARG;; *) exit 2;; esac; done
