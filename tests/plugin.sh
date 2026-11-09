@@ -50,6 +50,9 @@ case "\$1 \$2" in
   "agent list") cat "$T/agents.json" ;;
   "workspace list") echo '{"result":{"workspaces":[]}}' ;;
   "pane list") echo '{"result":{"panes":[]}}' ;;
+  "pane get") grep -qx "\$3" "$T/live-panes" 2>/dev/null || exit 1 ;;
+  "agent read") printf 'Reading src/x.rs\n\n────────────\nEditing src/x.rs: 3 lines\n' ;;
+  "workspace focus") [[ \$3 != w404 ]] || exit 1 ;;
 esac
 EOF
   # draft's dispatcher: answers with a valid task file whatever it is asked.
@@ -221,10 +224,120 @@ setup; pane settings ""
 check "settings keeps an existing herd.conf" grep -qx 'HERD_BASE=main' "$T/conf/herd.conf"
 rm "$T/conf/herd.conf"; pane settings ""
 check "settings creates herd.conf from the template" grep -q '^#HERD_NOTIFY=batch' "$T/conf/herd.conf"
-setup; pane menu $'5\nq'
+setup; pane menu $'6\nq'
 check "the menu runs status inline" out_has "herd status  $repo"
-: >"$T/calls"; pane menu $'3\n'
+: >"$T/calls"; pane menu $'4\n'
 check "the menu sends a plan to a tab of its own" called "--entrypoint plan "
+
+# --- the dashboard -----------------------------------------------------------------------------
+echo "dashboard"
+setup
+: >"$T/calls"; HERDR_PLUGIN_CONTEXT_JSON="{\"focused_pane_cwd\":\"$wt\"}" act dashboard
+check "opens as a tab of the repo's own workspace" called "--entrypoint dashboard --env PATH="
+check "...in the main checkout's workspace (w1)" called "--env HERD_REPO=$repo --workspace w1"
+mkdir -p "$T/state/dashboards"; echo w1:p7 >"$T/state/dashboards/$(printf '%s' "$repo" | tr -c 'A-Za-z0-9._-' '_')"
+: >"$T/calls"; HERDR_PLUGIN_CONTEXT_JSON="{\"focused_pane_cwd\":\"$repo\"}" act dashboard
+check "a stale record (pane gone) opens a new one" called "--entrypoint dashboard"
+echo w1:p7 >"$T/live-panes"
+echo w1:p7 >"$T/state/dashboards/$(printf '%s' "$repo" | tr -c 'A-Za-z0-9._-' '_')"
+: >"$T/calls"; HERDR_PLUGIN_CONTEXT_JSON="{\"focused_pane_cwd\":\"$repo\"}" act dashboard
+check "an open one is focused instead" called "plugin pane focus w1:p7"
+check "...and no second one opens" not_called "--entrypoint dashboard"
+
+setup
+mkdir -p "$wt/.herd/run"
+printf 'stage=2\nstatus=running\n' >"$wt/.herd/run/state"
+printf '## Stage 1: Parse\n## Stage 2: Writer\n## Stage 3: Docs\n' >"$wt/.herd/run/stages.md"
+printf '## Stage 1\nParser done, tests pass.\n' >"$wt/.herd/run/PROGRESS.md"
+git -C "$wt" commit -q --allow-empty -m "parse the input"
+wtb=$T/git/wt/proj/feat-b; git -C "$repo" worktree add -q -b feat/b "$wtb"
+jq --arg p "$wtb" '.result.worktrees += [{path: $p, branch: "feat/b", is_linked_worktree: true, open_workspace_id: "w6"}]' \
+  "$T/worktrees.json" >"$T/w.json" && mv "$T/w.json" "$T/worktrees.json"
+agents feat-a w5:p1 "$wt" working feat-b w6:p1 "$wtb" blocked
+pane dashboard q
+check "exits 0 on q" test "$rc" = 0
+check "the header counts the streams by status" out_has "2 stream(s): 1 blocked · 1 working"
+check "lists each stream with its status" grep -qE '^> feat/a +working +stage 2/3 running +w5' "$T/out"
+check "...and the other one" grep -qE '^  feat/b +blocked' "$T/out"
+check "the plan timeline marks done, current and to come" \
+  bash -c "grep -q '✓ 1 Parse' '$T/out' && grep -q '▶ 2 Writer' '$T/out' && grep -q '· 3 Docs' '$T/out'"
+check "shows commits ahead of the base" out_has "1 commit(s) ahead of main"
+check "shows the progress log" out_has "Parser done, tests pass."
+check "shows the agent's screen, without blank or rule lines" \
+  bash -c "grep -q 'Editing src/x.rs: 3 lines' '$T/out' && ! grep -q '────' '$T/out'"
+check "removes its marker when it closes" bash -c "! ls '$T'/state/dashboards/.mark.* 2>/dev/null"
+
+pane dashboard $'j\n'
+check "j selects the next stream" grep -qE '^> feat/b' "$T/out"
+check "enter goes to its workspace" called "workspace focus w6"
+setup; : >"$T/calls"; pane dashboard o
+check "o goes to the stream's workspace" called "workspace focus w5"
+check "...and says so" out_has "went to workspace w5 (feat/a)"
+setup; agents; jq '.result.worktrees[1].open_workspace_id = "w404"' "$T/worktrees.json" >"$T/w.json" && mv "$T/w.json" "$T/worktrees.json"
+: >"$T/calls"; pane dashboard o
+check "a workspace that's gone and no agent: reopen the worktree" called "worktree open --cwd $repo --path $wt --focus"
+
+setup; pane dashboard $'xnope\n '
+check "x wants the word discard" out_has "nothing removed"
+check "...and removes nothing without it" not_called "worktree remove"
+setup; pane dashboard $'xdiscard\n '
+check "x discard removes the selected stream" called "worktree remove --workspace w5 --force"
+setup; agents feat-a w5:p1 "$wt" idle; pane dashboard $'dy\n '
+check "d runs herd done on the selected stream" out_has "can't check feat/a's PR"
+
+setup; pane dashboard r
+check "r with no plan says so" out_has "feat/a has no stopped plan"
+mkdir -p "$wt/.herd/run"; printf 'stage=1\nstatus=blocked\n' >"$wt/.herd/run/state"
+: >"$T/calls"; pane dashboard r
+check "r resumes a stopped plan in a tab of its own" called "--entrypoint plan-resume"
+check "...for the selected stream" called "--env HERD_BRANCH=feat/a"
+printf 'stage=1\nstatus=complete\n' >"$wt/.herd/run/state"
+(cd "$root" && HERD_REPO=$repo HERD_BRANCH=feat/a bash "$plugin" pane plan-resume <<<"") >"$T/out" 2>&1
+check "plan-resume with HERD_BRANCH runs herd plan -R on it without asking" \
+  bash -c "grep -q 'plan on feat/a is already complete' '$T/out' && ! grep -q 'plan to resume' '$T/out'"
+
+setup; pane dashboard $'f\ny\n '
+check "f runs the fan-out form inline" test "$(ncalls 'worktree create')" = 2
+setup; : >"$T/calls"; pane dashboard p
+check "p opens the plan form in a tab" called "--entrypoint plan "
+setup; echo hi >"$wt/hello.txt"; git -C "$wt" add hello.txt; git -C "$wt" commit -q -m "say hello"
+pane dashboard v
+check "v shows the branch's commits and diff against the base" \
+  bash -c "grep -q 'say hello' '$T/out' && grep -q '^+hi' '$T/out'"
+
+setup; rm -rf "$wt"; git -C "$repo" worktree prune
+jq '.result.worktrees |= map(select(.branch != "feat/a"))' "$T/worktrees.json" >"$T/w.json" && mv "$T/w.json" "$T/worktrees.json"
+pane dashboard q
+check "with no streams it says how to start some" out_has "no herd streams in this repo yet"
+(cd "$root" && bash "$plugin" pane dashboard <<<"") >"$T/out" 2>&1
+check "outside a repo it says to focus one" out_has "focus a pane inside a git repo"
+
+# On a real terminal: alternate screen in and out, colours, and the terminal's own size.
+if script --version 2>/dev/null | grep -q util-linux; then
+  setup
+  { sleep 1; printf j; sleep 0.5; printf q; } |
+    HERD_REPO=$repo script -qfec "cd '$root' && stty rows 30 cols 90 && bash '$plugin' pane dashboard" /dev/null >"$T/out" 2>&1
+  check "on a terminal it uses the alternate screen and leaves it" \
+    bash -c "grep -qF \$'\e[?1049h' '$T/out' && grep -qF \$'\e[?1049l' '$T/out'"
+  check "...highlights the selected stream" bash -c "grep -qF \$'\e[7m> feat/a' '$T/out'"
+  check "...cuts the rule to the terminal's width" grep -qE -- '-{90}' "$T/out"
+  check "...and restores the terminal on q" bash -c "tail -c 20 '$T/out' | grep -qF \$'\e[?25h'"
+else
+  echo "  skip terminal checks (no util-linux script)"
+fi
+
+echo "dashboard refresh"
+setup; mkdir -p "$T/state"
+(HERDR_PLUGIN_EVENT=worktree.created HERDR_PLUGIN_EVENT_JSON='{"event":"worktree_created"}' bash "$plugin" event) >"$T/out" 2>&1
+check "a worktree event touches the dashboards' tick" test -f "$T/state/tick"
+check "...and does nothing else" test ! -s "$T/calls"
+rm -f "$T/state/tick"; event w5:p1 idle
+check "an agent status change of a herd stream touches it too" test -f "$T/state/tick"
+# The loop reloads when the tick is newer than its last load: a pane reading slowly from a pipe
+# sees the hook fire between two keys.
+{ sleep 1.2; HERDR_PLUGIN_EVENT=worktree.removed bash "$plugin" event >/dev/null 2>&1; sleep 1.5; echo q; } |
+  (cd "$root" && HERD_REPO=$repo HERD_DASH_POLL=600 bash "$plugin" pane dashboard) >"$T/out" 2>&1
+check "an open dashboard redraws on the tick" test "$(grep -c -- '-- end of frame' "$T/out")" -ge 2
 
 # --- the event hook ----------------------------------------------------------------------------
 echo "event hook"

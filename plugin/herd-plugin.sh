@@ -25,6 +25,8 @@ root=$(dirname "$here")
 herd=$root/bin/herd
 [[ -f $herd ]] || herd=$root/../../bin/herd
 plugin_id=${HERDR_PLUGIN_ID:-lordmuffin.herd}
+# shellcheck source=plugin/dashboard.sh
+source "$here/dashboard.sh"
 
 # bin/herd calls plain `herdr`: make that the herdr running this plugin. The server's PATH can be
 # thin (a desktop launcher, launchd), so add the usual homes of claude, gh and fj too.
@@ -68,6 +70,9 @@ conf_template() {
 
 # 1: report a $herd token on herd's agent panes (branch, or plan stage) for the sidebar.
 #HERD_SIDEBAR=1
+
+# Seconds between the dashboard's reloads when no event nudges it sooner.
+#HERD_DASH_POLL=5
 EOF
 }
 
@@ -108,10 +113,20 @@ notify() { # title body sound
   herdr notification show "$1" --body "$2" --sound "${3:-none}" >/dev/null 2>&1 || true
 }
 
-open_pane() { # entrypoint repo
+open_pane() { # entrypoint repo [KEY=VALUE | --herdr-flag value ...]
   local args=(plugin pane open --plugin "$plugin_id" --entrypoint "$1" --env "PATH=$PATH" --focus)
   [[ -z ${2:-} ]] || args+=(--env "HERD_REPO=$2")
+  shift 2 || shift $#
+  while (($#)); do
+    case $1 in --*) args+=("$1" "$2"); shift 2 ;; *) args+=(--env "$1"); shift ;; esac
+  done
   herdr "${args[@]}" >/dev/null
+}
+
+# The workspace that has the repo's main checkout open, if any.
+repo_workspace() {
+  herdr worktree list --cwd "$1" 2>/dev/null |
+    jq -r '[.result.worktrees[] | select(.is_linked_worktree | not) | .open_workspace_id // empty][0] // empty'
 }
 
 action() {
@@ -120,11 +135,21 @@ action() {
     version)
       local v; v=$(run_herd --version)
       echo "$v"; notify "$v" "plugin $plugin_id at $root"; return ;;
-    menu | fanout | draft | plan | plan-resume | status | "done" | rm | personas | settings) ;;
+    menu | dashboard | fanout | draft | plan | plan-resume | status | "done" | rm | personas | settings) ;;
     *) echo "herd: unknown action '$1'" >&2; return 2 ;;
   esac
   local repo; repo=$(resolve_repo) || repo=""
+  if [[ $1 == dashboard && -n $repo ]]; then open_dashboard "$repo"; return; fi
   open_pane "$1" "$repo"
+}
+
+# One dashboard per repo: a second press goes back to it. A new one opens as a tab of the repo's
+# own workspace, also when the key is pressed in one of its streams.
+open_dashboard() { # repo
+  local ws
+  dash_focus_existing "$1" && return
+  ws=$(repo_workspace "$1")
+  open_pane dashboard "$1" ${ws:+--workspace "$ws"}
 }
 
 # --- pane helpers (stdin is the pane's terminal; tests feed it a script) -------------------------
@@ -198,6 +223,7 @@ streams() {
 # --- panes ----------------------------------------------------------------------------------------
 
 menu_items=(
+  "dashboard    Dashboard: live view of every stream, with actions"
   "fanout       Fan out a task file (one agent per line)"
   "draft        Draft a task file from a goal"
   "plan         Run a plan as gated stages"
@@ -219,6 +245,7 @@ pane_menu() {
     case $id in
       # A plan runs for hours, so it gets its own tab instead of this overlay.
       plan | plan-resume) open_pane "$id" "$repo"; return ;;
+      dashboard) if need_repo; then open_dashboard "$repo"; else pause; fi; return ;;
       version) run_herd --version; pause ;;
       *) "pane_${id//-/_}"; [[ $id == status ]] || pause ;;
     esac
@@ -332,10 +359,14 @@ plan_notify() { # branch rc
 pane_plan_resume() {
   need_repo || return
   local rows=() row branch
-  mapfile -t rows < <(streams | awk -F'\t' '$3 != "-" && $3 != "complete"')
-  if ((${#rows[@]} == 0)); then echo "no stopped plans in $repo"; return; fi
-  pick row "plan to resume" "${rows[@]}" || return
-  branch=${row%%$'\t'*}
+  if [[ -n ${HERD_BRANCH:-} ]]; then
+    branch=$HERD_BRANCH   # the dashboard's r: that stream's plan
+  else
+    mapfile -t rows < <(streams | awk -F'\t' '$3 != "-" && $3 != "complete"')
+    if ((${#rows[@]} == 0)); then echo "no stopped plans in $repo"; return; fi
+    pick row "plan to resume" "${rows[@]}" || return
+    branch=${row%%$'\t'*}
+  fi
   hr; run_herd plan -r "$repo" -R "$branch"
   plan_notify "$branch" $?
 }
@@ -404,6 +435,7 @@ pane() {
   case $1 in
     menu) pane_menu ;;
     status) pane_status ;;
+    dashboard) pane_dashboard ;;
     fanout | draft | plan | plan-resume | "done" | rm | personas | settings) "pane_${1//-/_}"; pause ;;
     *) echo "herd: unknown pane '$1'"; pause; return 2 ;;
   esac
@@ -426,6 +458,10 @@ plan_state() { sed -n "s/^$2=//p" "$1/.herd/run/state" 2>/dev/null; }
 event_hook() {
   load_conf
   local ev=${HERDR_PLUGIN_EVENT_JSON:-} pane st agents row cwd name wt prev key token pstatus
+  # A worktree came or went: only open dashboards care.
+  case ${HERDR_PLUGIN_EVENT:-} in
+    worktree.*) dash_tick; return 0 ;;
+  esac
   pane=$(jq -r '.data.pane_id // empty' <<<"$ev" 2>/dev/null)
   st=$(jq -r '.data.agent_status // empty' <<<"$ev" 2>/dev/null)
   [[ -n $pane && -n $st ]] || return 0
@@ -435,6 +471,7 @@ event_hook() {
   wt=$(herd_wt "$cwd") || return 0
   name=$(jq -r '.name // empty' <<<"$row"); name=${name:-$(basename "$wt")}
 
+  dash_tick
   mkdir -p "$state_dir/panes"
   key=$state_dir/panes/${pane//[^A-Za-z0-9_-]/_}
   prev=$(cat "$key" 2>/dev/null); echo "$st" >"$key"

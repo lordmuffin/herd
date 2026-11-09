@@ -10,7 +10,8 @@ HERDR  ?= herdr
 test:
 	bash -n bin/herd
 	bash -n plugin/herd-plugin.sh
-	shellcheck -S warning bin/herd plugin/herd-plugin.sh tests/plan.sh tests/worktree.sh tests/pr.sh tests/args.sh tests/version.sh tests/plugin.sh packaging/release-assets.sh
+	bash -n plugin/dashboard.sh
+	shellcheck -S warning bin/herd plugin/herd-plugin.sh plugin/dashboard.sh tests/plan.sh tests/worktree.sh tests/pr.sh tests/args.sh tests/version.sh tests/plugin.sh packaging/release-assets.sh
 	bash tests/plan.sh
 	bash tests/worktree.sh
 	bash tests/pr.sh
@@ -29,6 +30,7 @@ install:
 	install -m644 personas/*.md $(SHARE)/personas/
 	install -Dm644 herdr-plugin.toml $(SHARE)/herdr-plugin.toml
 	install -Dm755 plugin/herd-plugin.sh $(SHARE)/plugin/herd-plugin.sh
+	install -Dm644 plugin/dashboard.sh $(SHARE)/plugin/dashboard.sh
 
 # Dev install: symlink, so edits in this checkout are live.
 link:

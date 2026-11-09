@@ -33,6 +33,12 @@ description = "Every herd command in one picker"
 command = ["bash", "plugin/herd-plugin.sh", "action", "menu"]
 
 [[actions]]
+id = "dashboard"
+title = "herd: Dashboard"
+description = "A live view of this repo's streams, agents and plans, with done, discard, resume and more"
+command = ["bash", "plugin/herd-plugin.sh", "action", "dashboard"]
+
+[[actions]]
 id = "fanout"
 title = "herd: Fan out a task file"
 description = "Start one agent per line of Tasks.herd (or another .herd file), each in its own worktree and workspace"
@@ -100,6 +106,13 @@ title = "herd"
 placement = "overlay"
 command = ["bash", "plugin/herd-plugin.sh", "pane", "menu"]
 
+# The dashboard stays open as a tab of the repo's workspace; a second press focuses it.
+[[panes]]
+id = "dashboard"
+title = "herd: dashboard"
+placement = "tab"
+command = ["bash", "plugin/herd-plugin.sh", "pane", "dashboard"]
+
 [[panes]]
 id = "fanout"
 title = "herd: fan out"
@@ -159,4 +172,13 @@ command = ["bash", "plugin/herd-plugin.sh", "pane", "settings"]
 # ignored. Output lands in `herdr plugin log list --plugin lordmuffin.herd`.
 [[events]]
 on = "pane.agent_status_changed"
+command = ["bash", "plugin/herd-plugin.sh", "event"]
+
+# Worktrees coming and going only nudge open dashboards to reload; nothing else happens.
+[[events]]
+on = "worktree.created"
+command = ["bash", "plugin/herd-plugin.sh", "event"]
+
+[[events]]
+on = "worktree.removed"
 command = ["bash", "plugin/herd-plugin.sh", "event"]
