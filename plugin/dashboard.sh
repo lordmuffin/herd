@@ -4,7 +4,8 @@
 # herd-plugin.sh, whose helpers (run_herd, ask, confirm, pause, open_pane, the pane_* forms) it
 # uses. Plain bash and jq, like the rest of herd: no build step, nothing new to install.
 #
-# Data comes from `herd status -j` plus each stream's .herd/run/ and git. It redraws when the
+# Data comes from `herd status -j` (git facts and plan stages included, so that logic lives in
+# bin/herd only), plus each stream's PROGRESS.md and agent screen. It redraws when the
 # plugin's event hook touches $state_dir/tick (an agent of a herd stream changed status, a
 # worktree came or went), and every HERD_DASH_POLL seconds regardless.
 #
@@ -23,14 +24,16 @@ dash_keys_help=(
 
 # --- data -------------------------------------------------------------------------------------
 
-# Streams of $repo into the D_* arrays, one index per stream.
+# Streams of $repo into the D_* arrays, one index per stream; D_JSON holds each one's whole
+# `herd status -j` object.
 dash_load() {
-  local b a s p pa w
-  D_BR=() D_AG=() D_ST=() D_PL=() D_PATH=() D_WS=()
-  while IFS=$'\t' read -r b a s p pa w; do
-    D_BR+=("$b") D_AG+=("$a") D_ST+=("$s") D_PL+=("$p") D_PATH+=("$pa") D_WS+=("$w")
-  done < <(run_herd status -j -r "$repo" 2>/dev/null |
-             jq -r '[.branch, .agent, .status, (if .plan == "" then "-" else .plan end), .path, .workspace] | @tsv' 2>/dev/null)
+  local line b a s p pa w
+  D_BR=() D_AG=() D_ST=() D_PL=() D_PATH=() D_WS=() D_JSON=()
+  while IFS= read -r line; do
+    IFS=$'\t' read -r b a s p pa w < <(jq -r '[.branch, .agent, .status,
+      (if .plan == "" then "-" else .plan end), .path, .workspace] | @tsv' <<<"$line" 2>/dev/null) || continue
+    D_BR+=("$b") D_AG+=("$a") D_ST+=("$s") D_PL+=("$p") D_PATH+=("$pa") D_WS+=("$w") D_JSON+=("$line")
+  done < <(run_herd status -j -b "$HERD_BASE" -r "$repo" 2>/dev/null)
   ((sel < ${#D_BR[@]})) || sel=$((${#D_BR[@]} - 1))
   ((sel >= 0)) || sel=0
   touch "$dash_mark"
@@ -48,33 +51,23 @@ dash_counts() {
   echo "$out"
 }
 
-# The plan's stages, one per line: "<mark> <n> <title>", the mark being ✓ done, ▶ current,
-# ! stopped there (blocked or failed), · to come. Nothing when the stream has no plan.
+# The plan's stages from a stream's JSON ($1), one per line: "<mark> <n> <title>", the mark being
+# ✓ done, ▶ current, ! stopped there, · to come. Nothing when the stream has no plan.
 dash_stages() {
-  local r=$1/.herd/run s st i n mark titles=()
-  [[ -f $r/state ]] || return 0
-  s=$(sed -n 's/^stage=//p' "$r/state") st=$(sed -n 's/^status=//p' "$r/state")
-  [[ -f $r/stages.md ]] && mapfile -t titles < <(sed -n 's/^## Stage [0-9][0-9]*:\{0,1\}[[:space:]]*//p' "$r/stages.md")
-  if ((${#titles[@]} == 0)); then echo "  ▶ $st"; return; fi
-  for i in "${!titles[@]}"; do
-    n=$((i + 1))
-    if [[ $st == complete ]] || ((n < ${s:-0})); then mark="✓"
-    elif ((n == ${s:-0})); then
-      case $st in verified) mark="✓" ;; blocked | failed) mark="!" ;; *) mark="▶" ;; esac
-    else mark="·"; fi
-    printf '  %s %d %s\n' "$mark" "$n" "${titles[i]}"
-  done
+  jq -r '.plan_detail // empty
+    | if (.stages | length) == 0 then "  ▶ \(.status // "-")"
+      else .stages[] | "  \({done: "✓", current: "▶", stopped: "!", todo: "·"}[.state]) \(.n) \(.title)" end' \
+    <<<"$1" 2>/dev/null
 }
 
-# git facts for a worktree: commits ahead of the base, uncommitted files, the last commit.
+# git facts from a stream's JSON ($1): commits ahead of the base, uncommitted files, the last commit.
 dash_git() {
-  local p=$1 ahead dirty last
+  local p
+  p=$(jq -r .path <<<"$1")
   [[ -d $p ]] || { echo "  (worktree missing: $p)"; return; }
-  ahead=$(git -C "$p" rev-list --count "$HERD_BASE..HEAD" 2>/dev/null || echo "?")
-  dirty=$(git -C "$p" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
-  last=$(git -C "$p" log -1 --format='%h %s (%cr)' 2>/dev/null)
-  echo "  $ahead commit(s) ahead of $HERD_BASE · $dirty uncommitted file(s)"
-  [[ -z $last ]] || echo "  last: $last"
+  jq -r --arg base "$HERD_BASE" '
+    "  \(.ahead // "?") commit(s) ahead of \($base) · \(.dirty // "?") uncommitted file(s)",
+    (.last_commit // empty | "  last: \(.sha) \(.subject) (\(.rel_time))")' <<<"$1" 2>/dev/null
 }
 
 # The last few lines that say something, from a file or a command's output on stdin.
@@ -131,13 +124,13 @@ dash_draw() {
     i=$sel branch=${D_BR[i]} path=${D_PATH[i]} st=${D_ST[sel]}
     dash_line ""
     dash_line "$branch   agent ${D_AG[i]} ($st)   ${path/#$HOME/\~}" 1
-    stages=$(dash_stages "$path")
+    stages=$(dash_stages "${D_JSON[i]}")
     if [[ -n $stages ]]; then
       dash_line "plan  ${D_PL[i]}" 2
       while IFS= read -r row; do dash_line "$row"; done <<<"$stages"
     fi
     dash_line "git" 2
-    while IFS= read -r row; do dash_line "$row"; done < <(dash_git "$path")
+    while IFS= read -r row; do dash_line "$row"; done < <(dash_git "${D_JSON[i]}")
     if [[ -f $path/.herd/run/PROGRESS.md ]]; then
       dash_line "progress (.herd/run/PROGRESS.md)" 2
       while IFS= read -r row; do dash_line "  $row"; done < <(dash_tail 4 <"$path/.herd/run/PROGRESS.md")
