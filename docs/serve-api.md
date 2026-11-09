@@ -122,3 +122,41 @@ with a message on stderr, and prints no JSON.
 `text` stops at 200 KB (204800 bytes); `truncated` is true when it was cut. A cut can land inside
 a multi-byte character, which then shows as U+FFFD. Without `-j`, `herd show` prints the (capped)
 text itself.
+
+## `herd serve`: the HTTP routes
+
+`herd serve [--listen ADDR] [--port N] [--read-only]` runs `serve/herd_serve.py` (Python 3, stdlib
+only; herd itself doesn't need Python). It binds `127.0.0.1:8380` by default (8375 and 8376 are the
+relay's). herd.conf's `HERD_SERVE_LISTEN`, `HERD_SERVE_PORT`, `HERD_SERVE_READ_ONLY=1` and
+`HERD_SERVE_HOSTS` set the same; flags win. It passes herd.conf's `HERD_BASE` as `-b` to every
+command below and exports `HERD_RELAY_HOST`.
+
+| route | auth | answer |
+| --- | --- | --- |
+| `GET /`, `GET /static/<file>` | none | `web/index.html`, `web/<file>` |
+| `GET /healthz` | none | `ok` |
+| `GET /api/snapshot` | token | `herd status -j -a`, reused for 2 s (or until the nudge file changes) |
+| `GET /api/show?repo=&branch=&what=` | token | `herd show -j`; 404 unless `repo` is a `repos[].path` of the snapshot and `branch` one of its streams, 400 for a bad `what` |
+| `GET /api/events` | token, or `?t=<token>` | Server-Sent Events, below |
+
+A failing herd command is a 502 with `{error}`; every /api answer is `Cache-Control: no-store`.
+
+**Events.** `/api/events` sends `event: snapshot` with the snapshot as `data` at once, then again
+whenever it changes. It checks every 5 s, and at once when `<state dir>/serve.nudge` changes its
+mtime: the herdr plugin's event hook touches that file on every agent status change of a herd
+stream and every worktree event. A `: keep-alive` comment goes out every 20 s without a change. A
+failing check sends `event: error` with `{error}` and the stream carries on.
+
+**Auth.** The state dir is `$HERD_STATE_DIR`, else `${XDG_STATE_HOME:-~/.local/state}/herd`. The
+first start on loopback writes `serve-tokens.json` there (mode 0600) with a `reader` and a
+`controller` token. Every /api route wants `Authorization: Bearer <token>` (401 without);
+`/api/events` also takes `?t=`, since EventSource can't set headers, and the server never logs a
+query string. Both tokens can read; only the controller will be able to write (no write routes
+yet: every POST is a 405).
+
+**Host check.** A request whose `Host` is not the bound address, `localhost` or a
+`HERD_SERVE_HOSTS` entry (space or comma separated) is a 403, `/healthz` included. This stops DNS
+rebinding.
+
+**Off loopback.** A non-loopback address needs `--listen` on the command line (one from herd.conf
+alone is refused) and the tokens file to exist already (start once on loopback to make it).

@@ -11,7 +11,8 @@ test:
 	bash -n bin/herd
 	bash -n plugin/herd-plugin.sh
 	bash -n plugin/dashboard.sh
-	shellcheck -S warning bin/herd plugin/herd-plugin.sh plugin/dashboard.sh tests/plan.sh tests/worktree.sh tests/pr.sh tests/args.sh tests/version.sh tests/plugin.sh tests/status.sh packaging/release-assets.sh
+	python3 -m py_compile serve/herd_serve.py
+	shellcheck -S warning bin/herd plugin/herd-plugin.sh plugin/dashboard.sh tests/plan.sh tests/worktree.sh tests/pr.sh tests/args.sh tests/version.sh tests/plugin.sh tests/status.sh tests/serve.sh packaging/release-assets.sh
 	bash tests/plan.sh
 	bash tests/worktree.sh
 	bash tests/pr.sh
@@ -19,9 +20,11 @@ test:
 	bash tests/version.sh
 	bash tests/plugin.sh packaging/release-assets.sh
 	bash tests/status.sh
+	bash tests/serve.sh
 
 # Copy into $(PREFIX) (default ~/.local). PKGBUILD uses this with PREFIX=/usr. The herdr plugin
-# lands in share/herd too, so `herdr plugin link $(PREFIX)/share/herd` registers it.
+# lands in share/herd too, so `herdr plugin link $(PREFIX)/share/herd` registers it, and so do
+# herd serve's server (serve/) and page (web/).
 install:
 	install -Dm755 bin/herd $(BIN)/herd
 	install -Dm644 VERSION $(SHARE)/VERSION
@@ -29,6 +32,9 @@ install:
 	install -Dm644 examples/plan.example.md $(SHARE)/plan.example.md
 	mkdir -p $(SHARE)/personas
 	install -m644 personas/*.md $(SHARE)/personas/
+	mkdir -p $(SHARE)/serve $(SHARE)/web
+	install -m644 serve/*.py $(SHARE)/serve/
+	install -m644 web/*.* $(SHARE)/web/
 	install -Dm644 herdr-plugin.toml $(SHARE)/herdr-plugin.toml
 	install -Dm755 plugin/herd-plugin.sh $(SHARE)/plugin/herd-plugin.sh
 	install -Dm644 plugin/dashboard.sh $(SHARE)/plugin/dashboard.sh

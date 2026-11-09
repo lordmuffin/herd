@@ -452,6 +452,14 @@ herd_wt() {
   echo "$HOME/git/wt/$r/$n"
 }
 
+# Tells a running herd serve to send a fresh snapshot now. Its state dir is herd's own (bin/herd
+# serve_state_dir), not this plugin's; it exists once herd serve has run.
+serve_nudge() {
+  local d=${HERD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herd}
+  [[ -d $d ]] && touch "$d/serve.nudge" 2>/dev/null
+  return 0
+}
+
 # A plan's state value $2 (stage, status) in worktree $1, or nothing.
 plan_state() { sed -n "s/^$2=//p" "$1/.herd/run/state" 2>/dev/null; }
 
@@ -460,7 +468,7 @@ event_hook() {
   local ev=${HERDR_PLUGIN_EVENT_JSON:-} pane st agents row cwd name wt prev key token pstatus
   # A worktree came or went: only open dashboards care.
   case ${HERDR_PLUGIN_EVENT:-} in
-    worktree.*) dash_tick; return 0 ;;
+    worktree.*) dash_tick; serve_nudge; return 0 ;;
   esac
   pane=$(jq -r '.data.pane_id // empty' <<<"$ev" 2>/dev/null)
   st=$(jq -r '.data.agent_status // empty' <<<"$ev" 2>/dev/null)
@@ -471,7 +479,7 @@ event_hook() {
   wt=$(herd_wt "$cwd") || return 0
   name=$(jq -r '.name // empty' <<<"$row"); name=${name:-$(basename "$wt")}
 
-  dash_tick
+  dash_tick; serve_nudge
   mkdir -p "$state_dir/panes"
   key=$state_dir/panes/${pane//[^A-Za-z0-9_-]/_}
   prev=$(cat "$key" 2>/dev/null); echo "$st" >"$key"

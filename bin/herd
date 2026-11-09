@@ -32,6 +32,10 @@
 #   herd show [-j] [-b ref] <repo> <branch> diff|progress|screen|log
 #                                     # one stream's diff or log against the base, its
 #                                     # PROGRESS.md or its agent's screen (-j: {text, truncated})
+#   herd serve [--listen ADDR] [--port N] [--read-only]
+#                                     # serve the streams as a web page and JSON API on
+#                                     # 127.0.0.1:8380 (needs python3; herd.conf HERD_SERVE_*
+#                                     # set the same; see docs/serve-api.md)
 #   herd version                      # print the version (also --version, -V)
 #   herd personas [<name>]            # list personas, or print one as a ready-to-paste prompt
 #   herd rm [-f file] <branch|name>...        # remove worktree, workspace and local branch
@@ -1046,8 +1050,63 @@ cmd_draft() {
   else echo "review it, then start it with: herd -f $out" >&2; fi
 }
 
+# --- herd serve: the web page and its API ---------------------------------------------------------
+# serve/herd_serve.py does the serving; this finds its files and settings and execs it. Settings
+# come from the plugin's herd.conf (HERD_SERVE_LISTEN, _PORT, _READ_ONLY, _HOSTS, plus HERD_BASE
+# and HERD_RELAY_HOST); flags win over them.
+
+# The plugin's herd.conf: $HERD_CONF, else herdr's config dir for the plugin, else the plugin's
+# own fallback. May not exist.
+herd_conf() {
+  local d
+  [[ -n ${HERD_CONF:-} ]] && { echo "$HERD_CONF"; return; }
+  d=${HERDR_PLUGIN_CONFIG_DIR:-$(herdr plugin config-dir lordmuffin.herd 2>/dev/null || true)}
+  echo "${d:-${XDG_CONFIG_HOME:-$HOME/.config}/herd/plugin}/herd.conf"
+}
+
+# herd serve's state (tokens, the nudge file the plugin's event hook touches). Not herdr's plugin
+# state dir: herd serve also runs outside herdr, where that dir is unknown.
+serve_state_dir() { echo "${HERD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herd}"; }
+
+cmd_serve() {
+  local d f py="" web="" conf listen="" port="" ro=0 args=()
+  while (($#)); do
+    case $1 in
+      --listen) [[ $# -ge 2 ]] || die "serve: --listen needs an address"; listen=$2; shift 2 ;;
+      --port) [[ ${2:-} =~ ^[0-9]+$ ]] || die "serve: --port needs a number"; port=$2; shift 2 ;;
+      --read-only) ro=1; shift ;;
+      -h|--help) echo "usage: herd serve [--listen ADDR] [--port N] [--read-only]"; exit ;;
+      *) die "serve: unknown option '$1' (want --listen ADDR, --port N, --read-only)" ;;
+    esac
+  done
+  conf=$(herd_conf)
+  HERD_SERVE_LISTEN="" HERD_SERVE_PORT=8380 HERD_SERVE_READ_ONLY=0 HERD_SERVE_HOSTS=""
+  HERD_BASE=origin/main
+  # shellcheck source=/dev/null
+  [[ -f $conf ]] && source "$conf"
+  d=$(script_dir "${BASH_SOURCE[0]}")
+  for f in "$d/../serve/herd_serve.py" "$d/../share/herd/serve/herd_serve.py"; do
+    [[ -f $f ]] && { py=$f; break; }
+  done
+  for f in "$d/../web" "$d/../share/herd/web"; do
+    [[ -f $f/index.html ]] && { web=$f; break; }
+  done
+  [[ -n $py && -n $web ]] || die "serve: cannot find serve/herd_serve.py and web/ next to $d"
+  have python3 || die "serve: needs python3 (herd itself doesn't; only herd serve does)"
+  args=(--port "${port:-$HERD_SERVE_PORT}" --state-dir "$(serve_state_dir)" --web "$web"
+        --base "$HERD_BASE" --hosts "$HERD_SERVE_HOSTS")
+  # Only a --listen given here counts as explicit; the server refuses a non-loopback address from
+  # herd.conf alone.
+  if [[ -n $listen ]]; then args+=(--listen "$listen")
+  elif [[ -n $HERD_SERVE_LISTEN ]]; then args+=(--conf-listen "$HERD_SERVE_LISTEN"); fi
+  [[ $ro == 1 || $HERD_SERVE_READ_ONLY == 1 ]] && args+=(--read-only)
+  [[ -n ${HERD_RELAY_HOST:-} ]] && export HERD_RELAY_HOST
+  exec python3 "$py" "${args[@]}" --herd "$BASH" "$d/herd"
+}
+
 case ${1:-} in
   version|--version|-V) cmd_version; exit ;;
+  serve) shift; cmd_serve "$@"; exit ;;
   ls) shift; cmd_ls; exit ;;
   status) shift; json=0 all=0
       while getopts "r:b:ja" o; do case $o in r) repo=$OPTARG;; b) base=$OPTARG;; j) json=1;; a) all=1;; *) exit 2;; esac; done

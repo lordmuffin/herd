@@ -10,7 +10,8 @@ plugin=$root/plugin/herd-plugin.sh
 manifest=$root/herdr-plugin.toml
 # Run inside a herdr pane, these would reach the real herdr and its workspaces.
 unset HERDR_BIN_PATH HERDR_SOCKET_PATH HERDR_PLUGIN_ID HERDR_PLUGIN_CONTEXT_JSON HERDR_PLUGIN_EVENT_JSON \
-  HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_PANE_ID HERDR_PLUGIN_CONFIG_DIR HERDR_PLUGIN_STATE_DIR HERD_REPO
+  HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_PANE_ID HERDR_PLUGIN_CONFIG_DIR HERDR_PLUGIN_STATE_DIR HERD_REPO \
+  XDG_STATE_HOME HERD_STATE_DIR
 export HERD_NO_FZF=1 EDITOR=true VISUAL=true
 
 pass=0 fail=0
@@ -333,6 +334,13 @@ check "a worktree event touches the dashboards' tick" test -f "$T/state/tick"
 check "...and does nothing else" test ! -s "$T/calls"
 rm -f "$T/state/tick"; event w5:p1 idle
 check "an agent status change of a herd stream touches it too" test -f "$T/state/tick"
+# herd serve's nudge is in herd's own state dir, and only once herd serve has made that dir.
+check "...but makes no herd serve state dir" test ! -e "$T/.local/state/herd"
+mkdir -p "$T/.local/state/herd"; event w5:p1 working
+check "with herd serve's state dir, a status change touches serve.nudge" test -f "$T/.local/state/herd/serve.nudge"
+rm -f "$T/.local/state/herd/serve.nudge"
+(HERDR_PLUGIN_EVENT=worktree.removed bash "$plugin" event) >"$T/out" 2>&1
+check "...and so does a worktree event" test -f "$T/.local/state/herd/serve.nudge"
 # The loop reloads when the tick is newer than its last load: a pane reading slowly from a pipe
 # sees the hook fire between two keys.
 { sleep 1.2; HERDR_PLUGIN_EVENT=worktree.removed bash "$plugin" event >/dev/null 2>&1; sleep 1.5; echo q; } |
