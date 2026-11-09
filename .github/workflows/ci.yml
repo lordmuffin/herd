@@ -20,72 +20,93 @@ jobs:
       - name: make test
         run: make test
 
-  release:
-    # Runs after the tests on every push to main (and on a pushed v* tag). It publishes
-    # v$(VERSION) unless that release already exists, so bumping VERSION is what ships.
-    # GitHub only: this workflow also runs on the Forgejo mirror source, where gh can't publish.
-    if: github.event_name == 'push' && github.server_url == 'https://github.com'
+  # Forgejo is canonical, so it cuts the release: after the tests pass on a push to main, if
+  # there is no v<VERSION> release yet, it creates one (which also creates the tag) with the
+  # tarball, SHA256SUMS, PKGBUILD and, if the runner has docker, the Arch package. The push
+  # mirror then carries the tag to GitHub, where the github-release job below mirrors it.
+  forgejo-release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.server_url != 'https://github.com'
     needs: test
     runs-on: ubuntu-latest
-    permissions:
-      contents: write   # create the tag and GitHub Release and upload its assets
-    concurrency:
-      # A main push and a tag push for the same version must not both publish.
-      group: release
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
       - name: Decide whether to release
         id: check
         env:
+          # The automatic token; set a FORGEJO_RELEASE_TOKEN secret (write:repository) if it
+          # lacks permission to create releases on your instance.
+          TOKEN: ${{ secrets.FORGEJO_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(head -n1 VERSION)
+          api="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY"
+          { echo "VERSION=$version"; echo "TAG=v$version"; echo "API=$api"; } >>"$GITHUB_ENV"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: token $TOKEN" "$api/releases/tags/v$version")
+          case $code in
+            200) echo "release v$version already exists; bump VERSION to ship a new one"
+                 echo "publish=false" >>"$GITHUB_OUTPUT" ;;
+            404) echo "publish=true" >>"$GITHUB_OUTPUT" ;;
+            *)   echo "checking for release v$version failed: HTTP $code" >&2; exit 1 ;;
+          esac
+
+      - name: Build release assets
+        if: steps.check.outputs.publish == 'true'
+        run: sudo apt-get update && sudo apt-get install -y jq && packaging/release-assets.sh
+
+      - name: Create Forgejo release
+        if: steps.check.outputs.publish == 'true'
+        env:
+          TOKEN: ${{ secrets.FORGEJO_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          body=$(jq -n --arg t "$TAG" --arg sha "$GITHUB_SHA" --arg n "herd $VERSION" \
+            '{tag_name: $t, target_commitish: $sha, name: $n, body: "", draft: false, prerelease: false}')
+          id=$(curl -fsS -X POST -H "Authorization: token $TOKEN" -H 'Content-Type: application/json' \
+            -d "$body" "$API/releases" | jq -r .id)
+          for f in dist/herd-"$VERSION".tar.gz dist/herd-*.pkg.tar.zst dist/SHA256SUMS dist/PKGBUILD; do
+            [ -f "$f" ] || continue
+            curl -fsS -X POST -H "Authorization: token $TOKEN" -F "attachment=@$f" \
+              "$API/releases/$id/assets?name=$(basename "$f")" >/dev/null
+            echo "uploaded $(basename "$f")"
+          done
+          echo "released $TAG: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG"
+
+  # GitHub mirrors the release when the tag arrives from Forgejo (or is pushed by hand). It
+  # never creates tags itself: the push mirror would delete a GitHub-only tag again.
+  github-release:
+    if: startsWith(github.ref, 'refs/tags/v') && github.server_url == 'https://github.com'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the GitHub Release and upload its assets
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag must match VERSION; skip if already released
+        id: check
+        env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          file=$(head -n1 VERSION)
-          echo "VERSION=$file" >>"$GITHUB_ENV"
-          echo "TAG=v$file" >>"$GITHUB_ENV"
-          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$file" ]; then
-            echo "tag $GITHUB_REF_NAME does not match VERSION ($file); bump VERSION and re-tag" >&2
-            exit 1
+          version=$(head -n1 VERSION)
+          echo "VERSION=$version" >>"$GITHUB_ENV"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match VERSION ($version)" >&2; exit 1
           fi
-          if gh release view "v$file" >/dev/null 2>&1; then
-            echo "release v$file already exists; bump VERSION to ship a new one"
-            echo "publish=false" >>"$GITHUB_OUTPUT"
-          else
-            echo "publish=true" >>"$GITHUB_OUTPUT"
-          fi
+          draft=$(gh release view "$GITHUB_REF_NAME" --json isDraft -q .isDraft 2>/dev/null || echo none)
+          case $draft in
+            false) echo "release $GITHUB_REF_NAME already published"; echo "publish=false" >>"$GITHUB_OUTPUT" ;;
+            true)  # left over from a tag the mirror deleted; replace it
+                   gh release delete "$GITHUB_REF_NAME" --yes; echo "publish=true" >>"$GITHUB_OUTPUT" ;;
+            *)     echo "publish=true" >>"$GITHUB_OUTPUT" ;;
+          esac
 
-      - name: Source tarball and checksums
+      - name: Build release assets
         if: steps.check.outputs.publish == 'true'
-        run: make dist
-
-      - name: Arch package
-        if: steps.check.outputs.publish == 'true'
-        run: |
-          # makepkg refuses to run as root, so build as an unprivileged user in an Arch container.
-          mkdir -p dist/arch
-          cp dist/herd-"$VERSION".tar.gz dist/arch/
-          sed -e "s/^pkgver=.*/pkgver=$VERSION/" \
-              -e "s/^sha256sums=.*/sha256sums=('$(cut -d' ' -f1 dist/SHA256SUMS)')/" \
-              packaging/arch/herd/PKGBUILD >dist/PKGBUILD
-          # Build from the local tarball, which is byte-identical to the release asset.
-          sed -e 's|^source=.*|source=("herd-$pkgver.tar.gz")|' dist/PKGBUILD >dist/arch/PKGBUILD
-          cp LICENSE dist/arch/
-          docker run --rm -v "$PWD/dist/arch:/build" archlinux:base-devel bash -c '
-            set -e
-            pacman -Syu --noconfirm --needed shellcheck jq git
-            useradd -m builder
-            chown -R builder /build
-            su builder -c "cd /build && makepkg -f --noconfirm"
-          '
-          cp dist/arch/*.pkg.tar.zst dist/
-          (cd dist && sha256sum herd-*.pkg.tar.zst >>SHA256SUMS)
+        run: packaging/release-assets.sh
 
       - name: Create GitHub Release
         if: steps.check.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # On a main push this also creates the tag, at the commit that was tested.
-          gh release create "$TAG" --target "$GITHUB_SHA" --title "herd $VERSION" --generate-notes \
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "herd $VERSION" --generate-notes \
             dist/herd-"$VERSION".tar.gz dist/herd-*.pkg.tar.zst dist/SHA256SUMS dist/PKGBUILD

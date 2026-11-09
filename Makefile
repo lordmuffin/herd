@@ -10,13 +10,13 @@ HERDR  ?= herdr
 test:
 	bash -n bin/herd
 	bash -n plugin/herd-plugin.sh
-	shellcheck -S warning bin/herd plugin/herd-plugin.sh tests/plan.sh tests/worktree.sh tests/pr.sh tests/args.sh tests/version.sh tests/plugin.sh
+	shellcheck -S warning bin/herd plugin/herd-plugin.sh tests/plan.sh tests/worktree.sh tests/pr.sh tests/args.sh tests/version.sh tests/plugin.sh packaging/release-assets.sh
 	bash tests/plan.sh
 	bash tests/worktree.sh
 	bash tests/pr.sh
 	bash tests/args.sh
 	bash tests/version.sh
-	bash tests/plugin.sh
+	bash tests/plugin.sh packaging/release-assets.sh
 
 # Copy into $(PREFIX) (default ~/.local). PKGBUILD uses this with PREFIX=/usr. The herdr plugin
 # lands in share/herd too, so `herdr plugin link $(PREFIX)/share/herd` registers it.
