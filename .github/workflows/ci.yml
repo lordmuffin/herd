@@ -15,14 +15,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck jq
+        # column is in bsdextrautils on Debian/Ubuntu; slim runner images (Forgejo) lack it.
+        run: sudo apt-get update && sudo apt-get install -y shellcheck jq bsdextrautils
       - name: make test
         run: make test
 
   release:
     # Runs after the tests on every push to main (and on a pushed v* tag). It publishes
     # v$(VERSION) unless that release already exists, so bumping VERSION is what ships.
-    if: github.event_name == 'push'
+    # GitHub only: this workflow also runs on the Forgejo mirror source, where gh can't publish.
+    if: github.event_name == 'push' && github.server_url == 'https://github.com'
     needs: test
     runs-on: ubuntu-latest
     permissions:
