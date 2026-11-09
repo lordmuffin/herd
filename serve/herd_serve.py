@@ -301,7 +301,7 @@ class Handler(BaseHTTPRequestHandler):
         if not token:
             return None
         found = None
-        for name, want in self.app.tokens.items():
+        for name, want in self.app.current_tokens().items():
             if hmac.compare_digest(token.encode(), want.encode()):
                 found = name
         return found
@@ -701,6 +701,8 @@ class App:
         self.hosts = {"localhost", args.listen.lower()}
         self.hosts.update(h.strip().lower() for h in args.hosts.replace(",", " ").split() if h.strip())
         self.tokens = None
+        self.tokens_path = os.path.join(args.state_dir, "serve-tokens.json")
+        self.tokens_seen = None  # (inode, mtime) of the tokens file as last read
         self.kind, self.agent_args = args.kind, args.agent_arg
         self.plugin = args.plugin or None
         self.repos = [os.path.realpath(r) for r in args.repos.replace(",", " ").split() if r.strip()]
@@ -712,6 +714,22 @@ class App:
         self.config = {"relay_app_url": args.relay_app_url or None,
                        "relay_host": args.relay_host or socket.gethostname().split(".")[0],
                        "read_only": self.read_only, "repos": self.repos}
+
+    def current_tokens(self):
+        """The tokens, read again when the file changed: `herd serve revoke` signs devices out
+        without a restart. A file that went missing or broke keeps the last good tokens."""
+        try:
+            st = os.stat(self.tokens_path)
+        except OSError:
+            return self.tokens
+        seen = (st.st_ino, st.st_mtime_ns)
+        if seen != self.tokens_seen:
+            try:
+                self.tokens = load_tokens(self.tokens_path, create=False) or self.tokens
+                self.tokens_seen = seen
+            except (OSError, ValueError) as e:
+                log("tokens: %s" % e)
+        return self.tokens
 
     def known_repos(self):
         """Real paths of the repos writes may touch: the snapshot's and HERD_SERVE_REPOS."""
@@ -786,7 +804,7 @@ def parse_args(argv):
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     app = App(args)
-    tokens_path = os.path.join(args.state_dir, "serve-tokens.json")
+    tokens_path = app.tokens_path
     try:
         if is_loopback(args.listen):
             app.tokens = load_tokens(tokens_path, create=True)
@@ -822,6 +840,7 @@ def main(argv=None):
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)  # the herdr tab it runs in closed
     shown = "[%s]" % host if ":" in str(host) else host
     log("listening on http://%s:%d/%s" % (shown, port, " (read-only)" if args.read_only else ""))
     try:

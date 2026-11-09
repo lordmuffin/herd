@@ -18,7 +18,7 @@
 
 id = "lordmuffin.herd"
 name = "herd"
-version = "0.1.0"   # kept equal to VERSION; make test checks
+version = "0.2.0"   # kept equal to VERSION; make test checks
 # Tested against 0.9.5. Uses plugin panes (incl. tab placement), workspace/agent/worktree APIs,
 # `notification show` and pane metadata tokens.
 min_herdr_version = "0.9.5"
@@ -79,6 +79,12 @@ id = "rm"
 title = "herd: Discard streams"
 description = "Remove worktree, workspace and local branch without any checks"
 command = ["bash", "plugin/herd-plugin.sh", "action", "rm"]
+
+[[actions]]
+id = "serve"
+title = "herd: Serve the web page"
+description = "Run herd serve in a tab, with the link to pair your phone; it stops when the tab closes"
+command = ["bash", "plugin/herd-plugin.sh", "action", "serve"]
 
 [[actions]]
 id = "personas"
@@ -154,6 +160,13 @@ id = "rm"
 title = "herd: discard"
 placement = "overlay"
 command = ["bash", "plugin/herd-plugin.sh", "pane", "rm"]
+
+# herd serve runs in the foreground here, so it lives as long as this tab.
+[[panes]]
+id = "serve"
+title = "herd: serve"
+placement = "tab"
+command = ["bash", "plugin/herd-plugin.sh", "pane", "serve"]
 
 [[panes]]
 id = "personas"

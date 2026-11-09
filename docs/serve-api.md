@@ -156,7 +156,17 @@ failing check sends `event: error` with `{error}` and the stream carries on.
 first start on loopback writes `serve-tokens.json` there (mode 0600) with a `reader` and a
 `controller` token. Every /api route wants `Authorization: Bearer <token>` (401 without);
 `/api/events` also takes `?t=`, since EventSource can't set headers, and the server never logs a
-query string. Both tokens can read; only the controller can write.
+query string. Both tokens can read; only the controller can write. The server reads the file
+again whenever it changes, so `herd serve revoke [--reader|--controller]` (a new token; both
+without a flag) signs out every device holding the old one at once. `herd serve pair [--reader]`
+prints `http://<address>:<port>/#t=<token>` for the listen address (not a wildcard) and each
+`HERD_SERVE_HOSTS` name, with a `qrencode -t ansiutf8` QR code for the non-loopback ones.
+
+**Lifetime.** SIGTERM and SIGHUP (the plugin's `serve` tab closing) stop it cleanly. `herd serve
+install` writes a systemd user unit (`~/.config/systemd/user/herd-serve.service`) or a launchd
+agent (`~/Library/LaunchAgents/lordmuffin.herd-serve.plist`) that runs `herd serve --listen
+<HERD_SERVE_LISTEN> --port <HERD_SERVE_PORT> [--read-only]` with `HERD_CONF` and the installing
+shell's `PATH`, and starts it; `herd serve uninstall` stops and removes it.
 
 **Host check.** A request whose `Host` is not the bound address, `localhost` or a
 `HERD_SERVE_HOSTS` entry (space or comma separated) is a 403, `/healthz` included. This stops DNS

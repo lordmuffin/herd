@@ -13,6 +13,8 @@ herd ls                                                    # agents and their st
 herd status                                                # this repo's streams, with plan stages
 herd status -j -a                                          # every repo's streams, as JSON (docs/serve-api.md)
 herd show -j . fix/foo diff                                # one stream's diff|log|progress|screen, as JSON
+herd serve                                                 # the streams as a web page for your phone
+herd serve pair                                            # the link (and QR code) to pair the phone
 herd done fix/foo                                          # after merge: remove worktree + branches
 herd done                                                  # close the whole Tasks.herd batch
 herd rm fix/foo                                            # discard a stream (no checks)
@@ -63,6 +65,7 @@ can run it from a shell with `herdr plugin action invoke lordmuffin.herd.<id>`:
 | `status` | the repo's streams: branch, agent, agent status, plan stage. Refreshes every 10 s |
 | `done` | pick streams and run `herd done` on them; the merge checks are unchanged |
 | `rm` | pick streams and discard them with no checks, after you type `discard` |
+| `serve` | runs `herd serve` in a tab, with the link to pair a phone at the top; it stops when the tab closes. See [Web page and phone](#web-page-and-phone) |
 | `personas` | lists personas and shows the prompt each one adds |
 | `settings` | opens `herd.conf` in `$EDITOR` |
 | `version` | shows the herd version as a notification |
@@ -340,12 +343,86 @@ half a fan-out going.
 It then removes the worktree, closes the workspace, and deletes the local and remote branch.
 `-F` skips the checks.
 
+## Web page and phone
+
+`herd serve` serves herd's streams as a small web page and JSON API, made for a phone: which
+stream is blocked, working or idle, each plan's stages, a stream's diff, log, progress and agent
+screen, and a **New** sheet to start work. It needs Python 3 (the standard library only); nothing
+else in herd does.
+
+**Two ways to prompt from the phone, on purpose.** Answering an agent (a permission prompt, a
+question) happens in Herdr Mobile, through the herdr relay: it is a live terminal, and it already
+knows how to talk to a pane. Every blocked card on the page has an **Open in Herdr Mobile** button
+that deep-links to that pane. Starting and closing *herd* work (a task, a draft and its fan-out, a
+plan, done, discard) goes through `herd serve`, because it runs `herd` on the computer, with the
+same checks as the CLI. herd serve never types into an agent's pane, and the relay never starts a
+herd stream.
+
+**On this computer first.** Run it, and open the link `herd serve pair` prints:
+
+```bash
+herd serve                  # 127.0.0.1:8380, until ^C (or run the plugin's serve action: a tab)
+herd serve pair             # the page's link, with this device's token in it
+```
+
+The first start on loopback writes two tokens to `~/.local/state/herd/serve-tokens.json` (mode
+0600). The plugin's `serve` action does both in a herdr tab and stops the server when the tab
+closes.
+
+**Over NetBird.** Listen on the computer's NetBird address and name the hostnames the phone uses,
+in herd.conf (the plugin's Settings action opens it):
+
+```bash
+HERD_SERVE_LISTEN=100.64.12.34              # this computer's NetBird IP
+HERD_SERVE_HOSTS="lap.netbird.cloud"        # other names the page is opened by (Host check)
+#HERD_SERVE_PORT=8380
+#HERD_SERVE_REPOS="$HOME/git/herd"          # repos to start streams in that have none yet
+```
+
+A non-loopback address is only used with `--listen` on the command line and once the tokens
+exist, so a stray herd.conf line can't open the server up: run `herd serve` once on loopback,
+then `herd serve --listen 100.64.12.34`. `herd serve install` does that for you: it writes a
+systemd user unit (`~/.config/systemd/user/herd-serve.service`, `Restart=on-failure`) on Linux or
+a launchd agent (`~/Library/LaunchAgents/lordmuffin.herd-serve.plist`) on macOS, with the flags
+from herd.conf, and starts it. Run it again after changing herd.conf; `herd serve uninstall`
+removes it. It never touches system-wide units. A systemd user unit stops when you log out
+unless lingering is on (`loginctl enable-linger`).
+
+**Pairing an Android phone.** Run `herd serve pair` on the computer. It prints a link per
+address, `http://<address>:<port>/#t=<token>`, and a QR code for each when `qrencode` is
+installed. Scan it (or open the link) on the phone, in Chrome. The page keeps the token and drops
+it from the address bar. Then Chrome's menu, **Add to Home screen** (or **Install app**), gives
+herd an icon and a full-screen window. `herd serve pair --reader` pairs a look-only device.
+
+**Answering from the phone.** Set `HERD_RELAY_APP_URL` in herd.conf to the Herdr Mobile app's
+URL (the address you open the relay app at). Without it the page shows no Open in Herdr Mobile
+button. `HERD_RELAY_HOST` sets this computer's name in the relay, if it isn't `hostname -s`.
+
+**Security model.**
+
+- Two tokens: a **reader** can look; the **controller** can also start, fan out, plan, finish
+  and discard streams. Every API call sends one as `Authorization: Bearer`; there are no cookies,
+  so another site can't make your browser act for you. `herd serve revoke [--reader|--controller]`
+  makes a new token, which signs out every device that had the old one, at once.
+- A request whose `Host` isn't the listen address, `localhost` or a `HERD_SERVE_HOSTS` name is
+  refused, which stops DNS rebinding. Listen on loopback or a private network (NetBird) only; the
+  server speaks plain HTTP.
+- Every write lands in `~/.local/state/herd/serve-audit.jsonl`: time, token role, route, repo,
+  branch and result. A prompt, goal or plan is kept only as its length and sha256.
+- Writes run `herd` with an argument list, never a shell, and check what they get: known repos
+  only, branch names as `herd draft` checks them, task files in the repo root only, a fan-out
+  only with the hash of its current preview, discard only with `discard` typed.
+- `herd serve --read-only` (or `HERD_SERVE_READ_ONLY=1`) turns every write off.
+
+The routes and their answers are in [docs/serve-api.md](docs/serve-api.md).
+
 ## Requirements
 
 - [herdr](https://herdr.dev). The plugin needs herdr 0.9.5 or newer. The CLI runs from inside a
   Herdr pane;
 - `bash` 4 or newer, `git`, `jq` and `curl` (`fzf` is optional, for the plugin's pickers);
 - `column` (from util-linux);
+- for `herd serve` only: Python 3 (`qrencode` is optional, for `herd serve pair`'s QR code);
 - for `herd done` and the PR check in `herd plan`: `gh` (logged in) for repos on github.com, and for
   any other host a Forgejo login via [forgejo-cli](https://codeberg.org/forgejo-contrib/forgejo-cli).
   `fj auth login` needs an OAuth app registered on the instance; where there isn't one, create a

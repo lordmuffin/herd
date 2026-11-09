@@ -36,6 +36,10 @@
 #                                     # serve the streams as a web page and JSON API on
 #                                     # 127.0.0.1:8380 (needs python3; herd.conf HERD_SERVE_*
 #                                     # set the same; see docs/serve-api.md)
+#   herd serve pair [--reader]        # print the page's pairing link (and a QR code)
+#   herd serve revoke [--reader|--controller]
+#                                     # rotate a token: signs out every device holding it
+#   herd serve install | uninstall    # run herd serve as a systemd user unit / launchd agent
 #   herd version                      # print the version (also --version, -V)
 #   herd personas [-j] [<name>]       # list personas (-j: as JSON), or print one as a
 #                                     # ready-to-paste prompt
@@ -93,8 +97,9 @@ cmd_version() {
   for f in "$d/../VERSION" "$d/../share/herd/VERSION"; do
     [[ -f $f ]] || continue
     v=$(head -n1 "$f")
-    # In a git checkout, say which commit this is, e.g. 0.1.0-3-gabc1234.
-    [[ $f == "$d/../VERSION" ]] && v=$(git -C "$d" describe --tags --match 'v*' --dirty 2>/dev/null || echo "$v")
+    # In a git checkout, say which commit this is, e.g. 0.1.0-3-gabc1234. Only against this
+    # VERSION's own tag: before a bumped VERSION is tagged, the plain VERSION is the truth.
+    [[ $f == "$d/../VERSION" ]] && v=$(git -C "$d" describe --tags --match "v$v" --dirty 2>/dev/null || echo "$v")
     echo "herd ${v#v}"; return
   done
   echo "herd unknown"
@@ -1073,22 +1078,233 @@ herd_conf() {
 # state dir: herd serve also runs outside herdr, where that dir is unknown.
 serve_state_dir() { echo "${HERD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herd}"; }
 
-cmd_serve() {
-  local d f py="" web="" plugin="" conf listen="" port="" ro=0 args=() a agent=()
-  while (($#)); do
-    case $1 in
-      --listen) [[ $# -ge 2 ]] || die "serve: --listen needs an address"; listen=$2; shift 2 ;;
-      --port) [[ ${2:-} =~ ^[0-9]+$ ]] || die "serve: --port needs a number"; port=$2; shift 2 ;;
-      --read-only) ro=1; shift ;;
-      -h|--help) echo "usage: herd serve [--listen ADDR] [--port N] [--read-only]"; exit ;;
-      *) die "serve: unknown option '$1' (want --listen ADDR, --port N, --read-only)" ;;
-    esac
-  done
+# herd.conf's settings, with herd serve's defaults first. Sets conf to the file's path.
+serve_conf() {
   conf=$(herd_conf)
   HERD_SERVE_LISTEN="" HERD_SERVE_PORT=8380 HERD_SERVE_READ_ONLY=0 HERD_SERVE_HOSTS=""
   HERD_BASE=origin/main HERD_RELAY_APP_URL="" HERD_SERVE_REPOS="" HERD_KIND=claude HERD_AGENT_ARGS=""
   # shellcheck source=/dev/null
   [[ -f $conf ]] && source "$conf"
+  return 0
+}
+
+serve_tokens() { echo "$(serve_state_dir)/serve-tokens.json"; }
+
+# 32 random bytes as URL-safe base64, like the server's secrets.token_urlsafe(32).
+new_token() { head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n'; }
+
+# Replaces the tokens file with JSON $1, atomically, mode 0600 in a 0700 dir. A running herd serve
+# notices the new file on its next request.
+write_tokens() {
+  local f; f=$(serve_tokens)
+  (umask 077; mkdir -p "${f%/*}" && jq . <<<"$1" >"$f.$$" && mv -f "$f.$$" "$f") || die "serve: cannot write $f"
+}
+
+# The tokens file, made with two new tokens if it doesn't exist yet.
+ensure_tokens() {
+  local f; f=$(serve_tokens)
+  [[ -f $f ]] && return
+  write_tokens "$(jq -cn --arg r "$(new_token)" --arg c "$(new_token)" '{reader: $r, controller: $c}')"
+  echo "herd: wrote new reader and controller tokens to $f" >&2
+}
+
+is_loopback_addr() { [[ $1 == 127.* || $1 == localhost || $1 == ::1 ]]; }
+
+# Where a browser can reach herd serve: the listen address (not a wildcard), then HERD_SERVE_HOSTS.
+serve_addrs() {
+  local a seen=" "
+  for a in ${HERD_SERVE_LISTEN:-127.0.0.1} ${HERD_SERVE_HOSTS//,/ }; do
+    [[ $a == 0.0.0.0 || $a == :: || $seen == *" $a "* ]] && continue
+    seen+="$a "; echo "$a"
+  done
+}
+
+cmd_serve_pair() {
+  local role=controller a url tok qr=0
+  while (($#)); do
+    case $1 in
+      --reader) role=reader; shift ;;
+      --listen) [[ $# -ge 2 ]] || die "serve pair: --listen needs an address"; listen=$2; shift 2 ;;
+      -h|--help) echo "usage: herd serve pair [--reader] [--listen ADDR]"; exit ;;
+      *) die "serve pair: unknown option '$1' (want --reader, --listen ADDR)" ;;
+    esac
+  done
+  serve_conf
+  [[ -z ${listen:-} ]] || HERD_SERVE_LISTEN=$listen
+  ensure_tokens
+  tok=$(jq -r --arg r "$role" '.[$r] // empty' "$(serve_tokens)")
+  [[ -n $tok ]] || die "serve pair: no $role token in $(serve_tokens)"
+  have qrencode && qr=1
+  if [[ $role == controller ]]; then
+    echo "Pair a device by opening this on it. Controller token: it can start, finish and discard streams (--reader: look only)."
+  else
+    echo "Pair a device by opening this on it. Reader token: it can look, not change anything."
+  fi
+  while IFS= read -r a; do
+    url="http://$([[ $a == *:* ]] && echo "[$a]" || echo "$a"):$HERD_SERVE_PORT/#t=$tok"
+    echo
+    if is_loopback_addr "$a"; then echo "  $url   (this computer only)"; continue; fi
+    echo "  $url"
+    ((qr)) && qrencode -t ansiutf8 "$url"
+  done < <(serve_addrs)
+  if ! serve_addrs | grep -qv '^127\.\|^localhost$\|^::1$'; then
+    echo; echo "For a phone, listen on an address it can reach: HERD_SERVE_LISTEN=<netbird ip> in $conf, or HERD_SERVE_HOSTS for a name."
+  elif ((!qr)); then
+    echo; echo "Install qrencode to get a QR code to scan here as well."
+  fi
+  echo; echo "The link carries a secret: open it only on your own devices. herd serve revoke --$role signs them all out."
+}
+
+cmd_serve_revoke() {
+  local roles=() f doc r
+  while (($#)); do
+    case $1 in
+      --reader) roles+=(reader) ;;
+      --controller) roles+=(controller) ;;
+      -h|--help) echo "usage: herd serve revoke [--reader|--controller]   (both without a flag)"; exit ;;
+      *) die "serve revoke: unknown option '$1' (want --reader or --controller)" ;;
+    esac
+    shift
+  done
+  ((${#roles[@]})) || roles=(reader controller)
+  ensure_tokens
+  f=$(serve_tokens); doc=$(cat "$f")
+  for r in "${roles[@]}"; do doc=$(jq -c --arg r "$r" --arg t "$(new_token)" '.[$r] = $t' <<<"$doc"); done
+  write_tokens "$doc"
+  echo "herd: new ${roles[*]} token(s) in $f. Every device paired with the old one is signed out; a running herd serve takes the new one at once."
+  echo "Pair your devices again with: herd serve pair$([[ ${roles[*]} == reader ]] && echo " --reader")"
+}
+
+# herd serve's argv for a service, as herd.conf sets it. --listen is explicit there, so a
+# non-loopback HERD_SERVE_LISTEN is used (herd serve refuses one from herd.conf alone).
+serve_argv() {
+  local d; d=$(script_dir "${BASH_SOURCE[0]}")
+  argv=("$BASH" "$d/herd" serve --listen "${HERD_SERVE_LISTEN:-127.0.0.1}" --port "$HERD_SERVE_PORT")
+  [[ $HERD_SERVE_READ_ONLY == 1 ]] && argv+=(--read-only)
+  return 0
+}
+
+serve_unit() { echo "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/herd-serve.service"; }
+serve_plist() { echo "$HOME/Library/LaunchAgents/lordmuffin.herd-serve.plist"; }
+
+# One word of a systemd ExecStart= or Environment= line.
+sd_quote() {
+  local s=${1//\\/\\\\}
+  s=${s//\"/\\\"} s=${s//%/%%} s=${s//\$/\$\$}
+  printf '"%s"' "$s"
+}
+
+xml_esc() { local s=${1//&/&amp;}; s=${s//</&lt;} s=${s//>/&gt;}; printf '%s' "$s"; }
+
+cmd_serve_install() {
+  [[ $# -eq 0 ]] || die "serve install takes no arguments: it reads herd.conf ($(herd_conf))"
+  local argv=() a f line="" uid
+  serve_conf
+  ensure_tokens   # off loopback, herd serve only starts with tokens made beforehand
+  serve_argv
+  case $(uname -s) in
+    Linux)
+      have systemctl || die "serve install: no systemctl here; start herd serve some other way"
+      f=$(serve_unit)
+      for a in "${argv[@]}"; do line+="${line:+ }$(sd_quote "$a")"; done
+      mkdir -p "${f%/*}"
+      cat >"$f" <<EOF
+# Written by herd serve install; herd serve uninstall removes it. Settings come from herd.conf:
+# change them there and run herd serve install again.
+[Unit]
+Description=herd serve: herd's streams as a web page and API
+After=network-online.target
+
+[Service]
+ExecStart=$line
+Environment=$(sd_quote "PATH=$PATH") $(sd_quote "HERD_CONF=$conf")
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+      echo "wrote $f:"; sed 's/^/  /' "$f"
+      systemctl --user daemon-reload
+      systemctl --user enable --now herd-serve.service
+      systemctl --user restart herd-serve.service   # a reinstall picks up new settings
+      echo "herd serve runs as a systemd user service: systemctl --user status herd-serve, journalctl --user -u herd-serve."
+      echo "It stops when you log out unless lingering is on (loginctl enable-linger)."
+      ;;
+    Darwin)
+      f=$(serve_plist); uid=$(id -u)
+      mkdir -p "${f%/*}" "$(serve_state_dir)"
+      {
+        cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Written by herd serve install; herd serve uninstall removes it. Settings come from herd.conf. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>lordmuffin.herd-serve</string>
+  <key>ProgramArguments</key>
+  <array>
+EOF
+        for a in "${argv[@]}"; do printf '    <string>%s</string>\n' "$(xml_esc "$a")"; done
+        cat <<EOF
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$(xml_esc "$PATH")</string>
+    <key>HERD_CONF</key><string>$(xml_esc "$conf")</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>StandardErrorPath</key><string>$(xml_esc "$(serve_state_dir)/serve.log")</string>
+</dict>
+</plist>
+EOF
+      } >"$f"
+      echo "wrote $f:"; sed 's/^/  /' "$f"
+      launchctl bootout "gui/$uid" "$f" >/dev/null 2>&1 || true
+      launchctl bootstrap "gui/$uid" "$f"
+      echo "herd serve runs as a launchd agent (lordmuffin.herd-serve); its log is $(serve_state_dir)/serve.log."
+      ;;
+    *) die "serve install knows systemd (Linux) and launchd (macOS), not $(uname -s)" ;;
+  esac
+}
+
+cmd_serve_uninstall() {
+  [[ $# -eq 0 ]] || die "serve uninstall takes no arguments"
+  local f
+  case $(uname -s) in
+    Linux)
+      f=$(serve_unit)
+      [[ -f $f ]] || { echo "herd: no herd serve unit at $f"; return; }
+      systemctl --user disable --now herd-serve.service || true
+      rm -f "$f"
+      systemctl --user daemon-reload
+      echo "removed $f" ;;
+    Darwin)
+      f=$(serve_plist)
+      [[ -f $f ]] || { echo "herd: no herd serve agent at $f"; return; }
+      launchctl bootout "gui/$(id -u)" "$f" >/dev/null 2>&1 || true
+      rm -f "$f"
+      echo "removed $f" ;;
+    *) die "serve uninstall knows systemd (Linux) and launchd (macOS), not $(uname -s)" ;;
+  esac
+}
+
+cmd_serve() {
+  local d f py="" web="" plugin="" conf listen="" port="" ro=0 args=() a agent=()
+  case ${1:-} in
+    pair | revoke | install | uninstall) f=$1; shift; "cmd_serve_$f" "$@"; return ;;
+  esac
+  while (($#)); do
+    case $1 in
+      --listen) [[ $# -ge 2 ]] || die "serve: --listen needs an address"; listen=$2; shift 2 ;;
+      --port) [[ ${2:-} =~ ^[0-9]+$ ]] || die "serve: --port needs a number"; port=$2; shift 2 ;;
+      --read-only) ro=1; shift ;;
+      -h|--help) echo "usage: herd serve [--listen ADDR] [--port N] [--read-only] | pair [--reader] | revoke [--reader|--controller] | install | uninstall"; exit ;;
+      *) die "serve: unknown option '$1' (want --listen ADDR, --port N, --read-only)" ;;
+    esac
+  done
+  serve_conf
   read -ra agent <<<"$HERD_AGENT_ARGS"
   d=$(script_dir "${BASH_SOURCE[0]}")
   for f in "$d/../serve/herd_serve.py" "$d/../share/herd/serve/herd_serve.py"; do

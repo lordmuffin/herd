@@ -135,7 +135,7 @@ action() {
     version)
       local v; v=$(run_herd --version)
       echo "$v"; notify "$v" "plugin $plugin_id at $root"; return ;;
-    menu | dashboard | fanout | draft | plan | plan-resume | status | "done" | rm | personas | settings) ;;
+    menu | dashboard | fanout | draft | plan | plan-resume | status | "done" | rm | personas | settings | serve) ;;
     *) echo "herd: unknown action '$1'" >&2; return 2 ;;
   esac
   local repo v ws fwd=(); repo=$(resolve_repo) || repo=""
@@ -242,6 +242,7 @@ menu_items=(
   "status       Status of this repo's streams"
   "done         Done: clean up merged streams"
   "rm           Discard streams (no checks)"
+  "serve        Serve the web page for your phone (until its tab closes)"
   "personas     Personas"
   "settings     Settings"
   "version      Version"
@@ -255,7 +256,7 @@ pane_menu() {
     id=${choice%% *}
     case $id in
       # A plan runs for hours, so it gets its own tab instead of this overlay.
-      plan | plan-resume) open_pane "$id" "$repo"; return ;;
+      plan | plan-resume | serve) open_pane "$id" "$repo"; return ;;
       dashboard) if need_repo; then open_dashboard "$repo"; else pause; fi; return ;;
       version) run_herd --version; pause ;;
       *) "pane_${id//-/_}"; [[ $id == status ]] || pause ;;
@@ -446,6 +447,14 @@ pane_personas() {
   done
 }
 
+# herd serve in the foreground, so it stops when this tab closes. The pairing link goes first.
+pane_serve() {
+  echo "herd serve: the streams as a web page, for your phone. Close this tab to stop it."; hr
+  run_herd serve pair; hr
+  run_herd serve
+  echo "herd serve stopped."
+}
+
 pane_settings() {
   mkdir -p "$conf_dir"
   [[ -f $conf ]] || conf_template >"$conf"
@@ -461,7 +470,7 @@ pane() {
     menu) pane_menu ;;
     status) pane_status ;;
     dashboard) pane_dashboard ;;
-    fanout | draft | plan | plan-resume | "done" | rm | personas | settings) "pane_${1//-/_}"; pause ;;
+    fanout | draft | plan | plan-resume | "done" | rm | personas | settings | serve) "pane_${1//-/_}"; pause ;;
     *) echo "herd: unknown pane '$1'"; pause; return 2 ;;
   esac
 }

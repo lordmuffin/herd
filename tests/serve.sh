@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Tests for herd serve (serve/herd_serve.py, started through `herd serve`): tokens, auth, the
-# Host check, the snapshot and show routes, the event stream, the write routes and a clean
-# SIGTERM. The server runs on a free port against a temp repo and the same faked herdr as
-# tests/status.sh; curl is the client. The write routes run a fake herd that only logs what it
-# was asked to do, so no agent ever starts.
+# Host check, the snapshot and show routes, the event stream, the write routes, a clean SIGTERM,
+# and herd serve pair, revoke, install and uninstall. The server runs on a free port against a
+# temp repo and the same faked herdr as tests/status.sh; curl is the client. The write routes run
+# a fake herd that only logs what it was asked to do, so no agent ever starts; systemctl,
+# launchctl and qrencode are fakes too, and install writes under the temp HOME.
 #
 #   bash tests/serve.sh        (make test runs it)
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -458,6 +459,96 @@ check "an explicit non-loopback --listen without tokens is refused" bash -c "tes
 check "...and writes no tokens" test ! -e "$state/serve-tokens.json"
 "$herd" serve --port x >"$T/log" 2>&1; rc=$?
 check "a bad --port is refused" test "$rc" != 0
+
+# --- pair, revoke, install ----------------------------------------------------------------------
+echo "pair"
+# Fakes for everything that would touch this machine: qrencode, systemctl, launchctl (and uname
+# for the macOS case). They only log.
+for c in qrencode systemctl launchctl; do
+  printf '#!/usr/bin/env bash\necho "%s $*" >>"%s/sys.calls"\n[[ %s != qrencode ]] || echo "QR($*)"\n' "$c" "$T" "$c" >"$T/bin/$c"
+  chmod +x "$T/bin/$c"
+done
+printf 'HERD_BASE=main\n' >"$HERD_CONF"
+"$herd" serve pair >"$T/out" 2>&1
+controller=$(token controller) reader=$(token reader)
+check "pair makes the tokens if there are none" test -n "$controller"
+check "...and prints the loopback link with the controller token" grep -qF "http://127.0.0.1:8380/#t=$controller" "$T/out"
+check "...says it only works on this computer, and how to reach it from a phone" \
+  bash -c "grep -q 'this computer only' '$T/out' && grep -q HERD_SERVE_LISTEN '$T/out'"
+check "...with no QR code for a loopback link" bash -c "! grep -q QR '$T/out'"
+printf 'HERD_BASE=main\nHERD_SERVE_LISTEN=100.64.1.2\nHERD_SERVE_HOSTS="lap.netbird.cloud, 100.64.1.2"\nHERD_SERVE_PORT=9000\n' >"$HERD_CONF"
+"$herd" serve pair >"$T/out" 2>&1
+check "a link for the listen address and each HERD_SERVE_HOSTS name, once each" \
+  bash -c "test \$(grep -c '^  http://' '$T/out') = 2 && grep -qF 'http://100.64.1.2:9000/#t=$controller' '$T/out' && grep -qF 'http://lap.netbird.cloud:9000/#t=$controller' '$T/out'"
+check "...each with a terminal QR code from qrencode -t ansiutf8" grep -qF "QR(-t ansiutf8 http://lap.netbird.cloud:9000/#t=$controller)" "$T/out"
+"$herd" serve pair --reader >"$T/out" 2>&1
+check "--reader pairs with the reader token instead" \
+  bash -c "grep -qF '#t=$reader' '$T/out' && ! grep -qF '$controller' '$T/out'"
+printf 'HERD_BASE=main\nHERD_SERVE_LISTEN=0.0.0.0\nHERD_SERVE_HOSTS=lap.netbird.cloud\n' >"$HERD_CONF"
+"$herd" serve pair >"$T/out" 2>&1
+check "a wildcard listen address gets no link, the names do" \
+  bash -c "! grep -q 0.0.0.0 '$T/out' && grep -qF 'http://lap.netbird.cloud:8380/' '$T/out'"
+
+echo "revoke"
+printf 'HERD_BASE=main\n' >"$HERD_CONF"
+start
+get /api/snapshot -H "Authorization: Bearer $reader"
+check "the reader token works before" test "$code" = 200
+"$herd" serve revoke --reader >"$T/out" 2>&1
+check "revoke --reader gives a new reader token and keeps the controller's" \
+  bash -c "[[ \$(jq -r .reader '$state/serve-tokens.json') != '$reader' && \$(jq -r .controller '$state/serve-tokens.json') == '$controller' ]]"
+check "...in a file still mode 0600" test "$(stat -c %a "$state/serve-tokens.json" 2>/dev/null || stat -f %Lp "$state/serve-tokens.json")" = 600
+get /api/snapshot -H "Authorization: Bearer $reader"
+check "a running herd serve refuses the old token at once (401)" test "$code" = 401
+get /api/snapshot -H "Authorization: Bearer $(token reader)"
+check "...and takes the new one" test "$code" = 200
+get /api/snapshot -H "Authorization: Bearer $controller"
+check "...while the controller keeps working" test "$code" = 200
+stop
+reader=$(token reader)
+"$herd" serve revoke >"$T/out" 2>&1
+check "revoke with no flag rotates both" \
+  bash -c "[[ \$(jq -r .reader '$state/serve-tokens.json') != '$reader' && \$(jq -r .controller '$state/serve-tokens.json') != '$controller' ]]"
+check "...and says to pair again" grep -q 'herd serve pair' "$T/out"
+"$herd" serve revoke --bogus >"$T/out" 2>&1; rc=$?
+check "an unknown revoke flag is refused" test "$rc" != 0
+
+echo "install"
+printf 'HERD_BASE=main\nHERD_SERVE_LISTEN=100.64.1.2\nHERD_SERVE_PORT=9000\nHERD_SERVE_READ_ONLY=1\n' >"$HERD_CONF"
+unit=$T/.config/systemd/user/herd-serve.service
+: >"$T/sys.calls"
+"$herd" serve install >"$T/out" 2>&1; rc=$?
+check "install writes a systemd user unit under ~/.config/systemd/user" bash -c "test $rc = 0 && test -f '$unit'"
+check "...running herd serve with herd.conf's flags, --listen explicit" \
+  grep -qF '"serve" "--listen" "100.64.1.2" "--port" "9000" "--read-only"' "$unit"
+check "...restarting on failure, with HERD_CONF and PATH set" \
+  bash -c "grep -qx 'Restart=on-failure' '$unit' && grep -qF '\"HERD_CONF=$HERD_CONF\"' '$unit' && grep -q '^Environment=\"PATH=' '$unit' && grep -qx 'WantedBy=default.target' '$unit'"
+check "...prints what it wrote" grep -qF "wrote $unit" "$T/out"
+check "...and enables it as a user unit, nothing system-wide" \
+  bash -c "grep -qx 'systemctl --user daemon-reload' '$T/sys.calls' && grep -qx 'systemctl --user enable --now herd-serve.service' '$T/sys.calls' && ! grep -v -- '--user' '$T/sys.calls' | grep -q systemctl"
+"$herd" serve uninstall >"$T/out" 2>&1
+check "uninstall disables and removes it" \
+  bash -c "test ! -e '$unit' && grep -qx 'systemctl --user disable --now herd-serve.service' '$T/sys.calls'"
+"$herd" serve uninstall >"$T/out" 2>&1; rc=$?
+check "...and says so when there is none" bash -c "test $rc = 0 && grep -q 'no herd serve unit' '$T/out'"
+printf '#!/usr/bin/env bash\necho Darwin\n' >"$T/bin/uname"; chmod +x "$T/bin/uname"
+plist=$T/Library/LaunchAgents/lordmuffin.herd-serve.plist
+: >"$T/sys.calls"
+"$herd" serve install >"$T/out" 2>&1; rc=$?
+check "on macOS install writes a launchd agent plist instead" bash -c "test $rc = 0 && test -f '$plist'"
+check "...a valid plist with the same argv, KeepAlive on failure" \
+  python3 -c "
+import plistlib, sys
+p = plistlib.load(open(sys.argv[1], 'rb'))
+a = p['ProgramArguments']
+assert p['Label'] == 'lordmuffin.herd-serve' and a[2:] == ['serve', '--listen', '100.64.1.2', '--port', '9000', '--read-only'], a
+assert p['KeepAlive'] == {'SuccessfulExit': False} and p['RunAtLoad'] and p['EnvironmentVariables']['HERD_CONF'] == sys.argv[2]
+" "$plist" "$HERD_CONF"
+check "...loaded into the user's own launchd domain" grep -qx "launchctl bootstrap gui/$(id -u) $plist" "$T/sys.calls"
+"$herd" serve uninstall >"$T/out" 2>&1
+check "...and uninstall boots it out and removes it" \
+  bash -c "test ! -e '$plist' && grep -qx 'launchctl bootout gui/$(id -u) $plist' '$T/sys.calls'"
+rm -f "$T/bin/uname"
 
 rm -rf "$T"
 echo

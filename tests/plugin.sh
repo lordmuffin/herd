@@ -229,6 +229,24 @@ check "the file has the dispatcher's task" grep -qx 'feat/x @engineer: Do x and 
 setup; rm "$repo/Tasks.herd"; pane draft $'Add x\n\nn\n'
 check "with no Tasks.herd it writes Tasks.herd" test -f "$repo/Tasks.herd"
 
+echo "pane serve"
+if command -v python3 >/dev/null; then
+  setup
+  port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+  printf 'HERD_BASE=main\nHERD_SERVE_PORT=%s\n' "$port" >"$T/conf/herd.conf"
+  # A closing tab hangs up the pane's whole process group; setsid gives this run one of its own.
+  (cd "$root" && HERD_REPO=$repo HERD_STATE_DIR=$T/st exec setsid bash "$plugin" pane serve </dev/null) >"$T/out" 2>&1 &
+  spid=$!
+  for ((i = 0; i < 50; i++)); do grep -q 'listening on' "$T/out" 2>/dev/null && break; sleep 0.1; done
+  kill -HUP -- "-$spid" 2>/dev/null; wait "$spid" 2>/dev/null; sleep 0.3
+  check "shows the pairing link first, with the controller token" \
+    bash -c "grep -qF 'http://127.0.0.1:$port/#t='\"\$(jq -r .controller '$T/st/serve-tokens.json')\" '$T/out'"
+  check "...then runs herd serve in the foreground" bash -c "grep -qF 'listening on http://127.0.0.1:$port/' '$T/out'"
+  check "...until the tab goes (SIGHUP)" bash -c "! pgrep -f '[h]erd_serve.py.*$T/st' >/dev/null"
+else
+  echo "  skip: no python3"
+fi
+
 echo "pane personas / settings / menu"
 setup; pane personas ""
 check "personas lists the shipped ones" out_has "engineer"

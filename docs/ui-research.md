@@ -250,14 +250,19 @@ progress (.herd/run/PROGRESS.md)
    using `pr_lookup` behind a new `herd status -p` or `herd pr` subcommand. Sort blocked first.
    Multi-select for done. Pause polling while the dashboard's tab isn't focused (`pane.focused`
    events). A `[[link_handlers]]` entry for PR URLs.
-4. **Optional read-only web page.** `herd serve`, on loopback, started from and dying with a
-   plugin pane. Only if a browser view of diffs and logs is wanted; approvals stay with the
-   mobile relay.
+4. **Web page and phone (done: `herd serve`).** Built further than sketched here: a phone-first
+   page and JSON API, on loopback or over NetBird, as a plugin tab or a systemd/launchd service,
+   paired with reader and controller tokens. The controller can also start tasks, drafts,
+   fan-outs and plans and finish or discard streams. Answering agents stays with the mobile
+   relay, which every blocked card deep-links to. See README, "Web page and phone", and
+   `docs/serve-api.md`.
 5. **Revisit compiled TUI or herdr-app** if bash rendering becomes the bottleneck (mouse,
    scrollable panes), or if herdr-app and hc become where herd's agents run.
 
 ## Open questions
 
-- Do you want the read-only web page (step 4), or is the mobile relay enough for away-from-desk?
+- ~~Do you want the read-only web page (step 4), or is the mobile relay enough for away-from-desk?~~
+  Answered: both. The relay answers agents; `herd serve` shows the streams and starts herd work
+  (README, "Web page and phone").
 - Should the dashboard replace the `status` action, or the `menu`, as the one key to bind?
 - Is a workspace-level summary token on the repo's workspace welcome, or is it sidebar noise?
