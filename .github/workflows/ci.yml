@@ -20,29 +20,45 @@ jobs:
         run: make test
 
   release:
-    # Only for version tags, and only once the tests pass.
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Runs after the tests on every push to main (and on a pushed v* tag). It publishes
+    # v$(VERSION) unless that release already exists, so bumping VERSION is what ships.
+    if: github.event_name == 'push'
     needs: test
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # create the GitHub Release and upload its assets
+      contents: write   # create the tag and GitHub Release and upload its assets
+    concurrency:
+      # A main push and a tag push for the same version must not both publish.
+      group: release
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
-      - name: Tag must match the VERSION file
+      - name: Decide whether to release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag=${GITHUB_REF_NAME#v}
           file=$(head -n1 VERSION)
-          if [ "$tag" != "$file" ]; then
+          echo "VERSION=$file" >>"$GITHUB_ENV"
+          echo "TAG=v$file" >>"$GITHUB_ENV"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$file" ]; then
             echo "tag $GITHUB_REF_NAME does not match VERSION ($file); bump VERSION and re-tag" >&2
             exit 1
           fi
-          echo "VERSION=$file" >>"$GITHUB_ENV"
+          if gh release view "v$file" >/dev/null 2>&1; then
+            echo "release v$file already exists; bump VERSION to ship a new one"
+            echo "publish=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >>"$GITHUB_OUTPUT"
+          fi
 
       - name: Source tarball and checksums
+        if: steps.check.outputs.publish == 'true'
         run: make dist
 
       - name: Arch package
+        if: steps.check.outputs.publish == 'true'
         run: |
           # makepkg refuses to run as root, so build as an unprivileged user in an Arch container.
           mkdir -p dist/arch
@@ -64,8 +80,10 @@ jobs:
           (cd dist && sha256sum herd-*.pkg.tar.zst >>SHA256SUMS)
 
       - name: Create GitHub Release
+        if: steps.check.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --title "herd $VERSION" --generate-notes \
+          # On a main push this also creates the tag, at the commit that was tested.
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "herd $VERSION" --generate-notes \
             dist/herd-"$VERSION".tar.gz dist/herd-*.pkg.tar.zst dist/SHA256SUMS dist/PKGBUILD

@@ -277,9 +277,11 @@ loop against a faked herdr), the same checks `makepkg` runs.
 ## Publishing (maintainer notes)
 
 The canonical repo is the private Forgejo; GitHub is a read-only mirror that builds releases.
-`.github/workflows/ci.yml` runs `make test` on every push and pull request, and on a `v*` tag
-also builds the source tarball, an Arch package and `SHA256SUMS`, and attaches them (plus a
-`PKGBUILD` with the checksum filled in) to a GitHub Release.
+`.github/workflows/ci.yml` runs `make test` on every push and pull request. After the tests pass
+on a push to main, it reads `VERSION`, and if there is no `vX.Y.Z` release for it yet, it tags
+that commit, builds the source tarball, an Arch package and `SHA256SUMS`, and attaches them
+(plus a `PKGBUILD` with the checksum filled in) to a GitHub Release. Merges that leave
+`VERSION` alone ship nothing.
 
 One-time setup:
 
@@ -291,8 +293,11 @@ One-time setup:
      Contents: read and write. Enable "Sync when commits are pushed". Tags are mirrored too.
    - **Manual.** `git remote add github git@github.com:lordmuffin/herd.git`, then
      `make sync-github` pushes `main` and all tags.
-3. Releasing: bump `VERSION`, commit to main, then `git tag vX.Y.Z && git push origin main vX.Y.Z`.
-   Once the mirror carries the tag, the workflow tests it, checks it matches `VERSION`, and
-   publishes the release. `make dist` builds the same tarball locally into `dist/`.
+3. Releasing: bump `VERSION` in the PR (or in a commit on main) and merge. Once the mirror carries
+   main to GitHub, the workflow publishes `v<VERSION>`. No manual tag is needed; pushing a `v*`
+   tag yourself still works, and it must match `VERSION`. `make dist` builds the same tarball
+   locally into `dist/`. The tag CI creates exists only on GitHub; run
+   `git fetch github --tags && git push origin --tags` to bring it back to Forgejo. A push
+   mirror pushes with `--mirror` and can delete GitHub-only tags, so fetch them back first.
 4. For the AUR, copy the release's `PKGBUILD` into an AUR `herd` repo and run
    `makepkg --printsrcinfo > .SRCINFO`.
