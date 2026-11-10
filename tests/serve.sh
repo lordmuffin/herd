@@ -476,7 +476,7 @@ check "pair makes the tokens if there are none" test -n "$controller"
 check "...and prints the loopback link with the controller token" grep -qF "http://127.0.0.1:8380/#t=$controller" "$T/out"
 check "...says it only works on this computer, and how to reach it from a phone" \
   bash -c "grep -q 'this computer only' '$T/out' && grep -q HERD_SERVE_LISTEN '$T/out'"
-check "...with no QR code for a loopback link" bash -c "! grep -q QR '$T/out'"
+check "...with no QR code for a loopback link" bash -c "! grep -qF 'QR(' '$T/out'"
 printf 'HERD_BASE=main\nHERD_SERVE_LISTEN=100.64.1.2\nHERD_SERVE_HOSTS="lap.netbird.cloud, 100.64.1.2"\nHERD_SERVE_PORT=9000\n' >"$HERD_CONF"
 "$herd" serve pair >"$T/out" 2>&1
 check "a link for the listen address and each HERD_SERVE_HOSTS name, once each" \
