@@ -16,8 +16,10 @@ ok() { pass=$((pass + 1)); echo "  ok   $1"; }
 bad() { fail=$((fail + 1)); echo "  FAIL $1"; [[ -z ${2:-} ]] || sed 's/^/       /' <<<"$2"; }
 check() { local name=$1; shift; if "$@"; then ok "$name"; else bad "$name" "$(cat "$T/out" 2>/dev/null)"; fi; }
 called() { grep -qF -- "$1" "$T/calls" 2>/dev/null; }
-# jqt <filter>: the filter holds for $T/out.
-jqt() { jq -e "$1" "$T/out" >/dev/null 2>&1; }
+# jqt <filter>: the filter holds for $T/out: it gives at least one result, and every one is true.
+# Not jq -e alone: on jq 1.6 its status comes from the last input, and a select() that drops it
+# (feat/a out of feat/a, feat/b) fails there though it passes on jq 1.7.
+jqt() { jq -en "[inputs | $1] | length > 0 and all" "$T/out" >/dev/null 2>&1; }
 run() { (cd "$repo" && "$herd" "$@") >"$T/out" 2>"$T/err"; rc=$?; }
 
 # Two repos, proj (streams feat/a, feat/b) and lib (stream fix/c), each a real worktree under
@@ -112,7 +114,7 @@ check "HERD_RELAY_HOST sets host" jqt '.host == "box"'
 agents; run status -j -b main
 check "no agent: status -, pane_id null" jqt 'select(.branch == "feat/a") | .status == "-" and .pane_id == null'
 run status -j -b nosuchref
-check "an unknown base gives ahead null, not a failure" bash -c "test $rc = 0 && jq -e 'select(.branch == \"feat/a\") | .ahead == null' '$T/out' >/dev/null"
+check "an unknown base gives ahead null, not a failure" bash -c "test $rc = 0 && jq -en '[inputs | select(.branch == \"feat/a\") | .ahead == null] | length > 0 and all' '$T/out' >/dev/null"
 rm -rf "$wtb"
 run status -j -b main
 check "a worktree that's gone: git facts null" \
