@@ -171,6 +171,37 @@ run_status
 check "the table has a header and a row per run" \
   eval 'grep -q "^BRANCH" "$T/out" && grep -Eq "feat/story +2/3 +fixing +no driver" "$T/out"'
 
-kill "$live" 2>/dev/null
+echo "plan stop"
+run_stop() { (cd "$repo" && "$herd" plan stop "$@") >"$T/out" 2>"$T/err"; rc=$?; }
+mk feat/tostop 1 running 1
+printf '## Stage 1: Title 1\nnotes\n' >"$run/PROGRESS.md"
+run_stop feat/tostop lab host is down
+check "appends STOPPED with the reason" eval '[[ $rc -eq 0 ]] && [[ $(grep -c "^STOPPED:" "$run/PROGRESS.md") -eq 1 ]] && grep -qx "STOPPED: lab host is down" "$run/PROGRESS.md"'
+run_stop feat/tostop again
+check "a second stop does not add another line" eval '[[ $rc -eq 0 ]] && [[ $(grep -c "^STOPPED:" "$run/PROGRESS.md") -eq 1 ]] && grep -q "already stopped" "$T/out"'
+run_status --json feat/tostop
+check "status sees the stop reason" jqt feat/tostop '.stopped == "lab host is down"'
+mk feat/defaultreason 1 running 1
+run_stop feat/defaultreason
+check "default reason" grep -qx "STOPPED: stopped by herd plan stop" "$run/PROGRESS.md"
+check "without --kill the driver is left alone" kill -0 "$live"
+(exec -a herd-fake2 sleep 60) &
+victim=$!
+mk feat/tokill 1 running 1
+printf 'pid=%s\nhost=%s\nstarted=%s\nheartbeat=%s\n' "$victim" "$(hostname -s)" "$(now)" "$(now)" >"$run/driver"
+run_stop --kill feat/tokill
+sleep 0.3
+check "--kill signals the driver, adds the line and logs a stopped event" eval '
+  [[ $rc -eq 0 ]] && ! kill -0 "$victim" 2>/dev/null && grep -q "^STOPPED:" "$run/PROGRESS.md" &&
+  [[ $(jq -r "select(.event == \"stopped\") | .stage" "$run/events.ndjson") == 1 ]]'
+mk feat/nokill 1 running 1
+run_stop --kill feat/nokill
+check "--kill with no live driver still stops the run" eval '[[ $rc -eq 0 ]] && grep -q "^STOPPED:" "$run/PROGRESS.md" && grep -q "no live driver" "$T/out"'
+run_stop nope
+check "a missing run exits 1" eval '[[ $rc -eq 1 ]] && grep -q "no plan run for nope" "$T/err"'
+run_stop
+check "no branch is a usage error" eval '[[ $rc -ne 0 ]] && grep -q "needs a branch" "$T/err"'
+
+kill "$live"
 echo "$pass passed, $fail failed"
 ((fail == 0))

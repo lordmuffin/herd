@@ -21,6 +21,8 @@ herd rm fix/foo                                            # discard a stream (n
 herd rm -f Tasks.herd                                      # discard a whole batch
 herd plan feat/big PLAN.md                                 # one plan, run stage by stage to one PR
 herd plan -R feat/big                                      # resume a plan that stopped
+herd plan status [--json]                                  # this repo's plan runs
+herd plan stop feat/big "why"                              # stop one at the end of the agent's turn
 ```
 
 `herd -h` lists every option. `examples/Tasks.example.herd` shows the useful task shapes:
@@ -254,7 +256,13 @@ herd plan -W 120 feat/lab PLAN.md          # wait up to 2 h for a stage's backgr
      soon as the turn ends, with that line as the reason and no fix-up turn. Use it for a
      plan's own stop rules ("if the lab host is unreachable, write `STOPPED: <why>`") instead of
      adding `! grep -q '^STOPPED' .herd/run/PROGRESS.md` to every `verify:`. Delete the line
-     before `-R`.
+     before `-R`, which prints the line if it is still there.
+
+`herd plan stop [--kill] <branch> [reason...]` writes that line for you (once, with the reason
+or "stopped by herd plan stop"), so the driver stops at the end of the agent's current turn. It
+needs a run on that branch and exits 1 without one. `--kill` also sends TERM to a live driver
+(the pid in `driver`, if it is a herd process on this host) and logs a `stopped` event; use it
+when the agent is stuck mid-turn. The agent itself is left alone.
 
 `.herd/run/` is added to the repo's `info/exclude`, so the plan, stages and handoff notes never
 land in the PR. `herd done <branch>` cleans up as usual once it merges. `verify:` commands run
@@ -270,7 +278,7 @@ herd plan status --json feat/x       # only these branches
 herd plan status --json --all        # every run under ~/git/wt/*/*/
 ```
 
-`status` is read first, so it can never be taken for a branch called "status". It only reads
+`status` (like `stop`) is read first, so it can never be taken for a branch of that name. It only reads
 `.herd/run/`: besides `state` herd writes `events.ndjson` (an append-only log, one JSON object per
 line: `at`, `stage`, `event`, `status`, optional `msg`), `driver` (`pid`, `host`, `started`, and a
 `heartbeat` rewritten every 30 s while herd runs; removed when it exits) and, on a finished last
@@ -279,7 +287,7 @@ stage, `pr` (`pr_number`, `pr_url`). It never calls the forge, and touches herdr
 first. An unknown branch is noted on stderr and makes the exit status 1; a run that can't be
 read is listed with an `error` and whatever could be read.
 
-`--json` prints one object. This is a contract: fields are added, never renamed or removed, and
+`--json` prints one object. Tether reads this; it is versioned. This is a contract: fields are added, never renamed or removed, and
 `version` changes only on a breaking change.
 
 ```json

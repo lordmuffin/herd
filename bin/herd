@@ -18,6 +18,14 @@
 #                                     # waited out before the gate, up to -W minutes (default 60).
 #                                     # A "STOPPED: reason" line in PROGRESS.md stops the run at once
 #   herd plan -R <branch>             # resume a plan stopped by a block, a failed gate or ^C
+#   herd plan status [--json] [--all | <branch>...]
+#                                     # read-only view of plan runs: a table, or with --json one
+#                                     # versioned JSON object (see README, "Plan status"); --all
+#                                     # covers every run under ~/git/wt/*/*/
+#   herd plan stop [--kill] <branch> [reason...]
+#                                     # append "STOPPED: reason" to the run's PROGRESS.md, so the
+#                                     # driver stops at the end of the agent's turn; --kill also
+#                                     # signals the driver
 #   herd draft [-o file] [-F] <goal|file|->
 #                                     # turn a goal into a task file: a read-only dispatcher agent
 #                                     # reads the repo and writes one "branch @persona: prompt" line
@@ -787,7 +795,7 @@ cmd_plan() {
   [[ -z $machine ]] || die "plan runs its checks in the worktree, so it works on this machine only (no -m)"
   [[ -n $repo ]] || repo=$(git rev-parse --show-toplevel)
   repo=$(cd "$repo" && git rev-parse --show-toplevel)
-  local text staged=0 tmp
+  local text staged=0 tmp line
   if ((resume)); then
     find_wt "$plan_branch" || exit 1
     wt_name=$(agent_name "$plan_branch") wt_path=$path run="$path/.herd/run"
@@ -795,6 +803,10 @@ cmd_plan() {
     load_state
     bg_wait=${bg_wait_opt:-$bg_wait}   # -W on a resume overrides the saved wait
     [[ $status != complete ]] || { echo "plan on $plan_branch is already complete"; return; }
+    if line=$(grep -m1 '^STOPPED:' "$run/PROGRESS.md" 2>/dev/null); then
+      echo "herd: PROGRESS.md still has a STOPPED line, the run will stop again at once: $line" >&2
+      echo "herd: delete that line from $run/PROGRESS.md to carry on" >&2
+    fi
     plan_event resume
     echo "resuming $plan_branch at stage $stage ($status)"
     drive_plan; return
@@ -960,6 +972,48 @@ plan_status_one() {
   rm -rf "$tmp"
 }
 
+# herd plan stop [--kill] [-r repo] <branch> [reason...]: appends "STOPPED: reason" to the run's
+# PROGRESS.md (once), which the driver picks up when the agent's turn ends, as if a stage had
+# written it. --kill also TERMs a live driver (the one in `driver`), and logs a stopped event.
+cmd_plan_stop() {
+  local kill=0 words=() b p r reason dpid="" dhost="" k v line
+  while (($#)); do
+    case $1 in
+      --kill) kill=1 ;;
+      -r) [[ $# -ge 2 ]] || die "plan stop: -r needs a repo"; repo=$2; shift ;;
+      -h|--help) usage; return ;;
+      --) shift; words+=("$@"); break ;;
+      -*) die "plan stop: unknown option $1" ;;
+      *) words+=("$1") ;;
+    esac; shift
+  done
+  [[ ${#words[@]} -ge 1 ]] || die "plan stop needs a branch: herd plan stop [--kill] <branch> [reason...]"
+  b=${words[0]}; reason="${words[*]:1}"
+  [[ -n ${reason//[[:space:]]/} ]] || reason="stopped by herd plan stop"
+  [[ -n $repo ]] || repo=$(git rev-parse --show-toplevel)
+  repo=$(cd "$repo" && git rev-parse --show-toplevel)
+  p=$(plan_wt_of "$repo" "$b") || p=""
+  [[ -n $p && -f $p/.herd/run/state ]] || die "no plan run for $b"
+  r=$p/.herd/run
+  if line=$(grep -m1 '^STOPPED:' "$r/PROGRESS.md" 2>/dev/null); then
+    echo "already stopped: $line"
+  else
+    printf 'STOPPED: %s\n' "${reason//$'\n'/ }" >>"$r/PROGRESS.md" || die "cannot write $r/PROGRESS.md"
+    echo "stopped $b: the driver ends the run when the agent's turn ends (herd plan -R $b resumes, after deleting that line)"
+  fi
+  ((kill)) || return 0
+  [[ -r $r/driver ]] && while IFS='=' read -r k v; do
+    case $k in pid) dpid=$v ;; host) dhost=$v ;; esac
+  done <"$r/driver" 2>/dev/null
+  if [[ -n $dpid && $dhost == "$(hostname -s 2>/dev/null)" ]] && plan_pid_is_herd "$dpid"; then
+    run=$r stage=$(sed -n 's/^stage=//p' "$r/state") status=$(sed -n 's/^status=//p' "$r/state")
+    [[ $stage =~ ^[0-9]+$ ]] || stage=0
+    plan_event stopped "killed driver $dpid: $reason"
+    kill "$dpid" 2>/dev/null || die "could not signal driver $dpid"
+    echo "sent TERM to the driver (pid $dpid)"
+  else echo "no live driver to kill"; fi
+}
+
 # A time like 2026-11-16T10:42:10Z as "5m ago", for the table.
 plan_status_table() {
   jq -r 'def ago: ([now - (try fromdateiso8601 catch now), 0] | max) as $s
@@ -969,6 +1023,14 @@ plan_status_table() {
          (.plans[] | [.branch, (if .total > 0 then "\([.stage, .total] | min)/\(.total)" else "-" end),
                       (.status // "?") + (if .error then " (" + .error + ")" else "" end),
                       (if .driver.alive then "alive" else "no driver" end), (.updated_at | ago)]) | @tsv' "$1" | column -t -s $'\t'
+}
+
+# The worktree of <branch> (by branch or agent-name path suffix) from the checkout's own
+# worktree list; find_wt would ask herdr, which status and stop never do.
+plan_wt_of() {
+  git -C "$1" worktree list --porcelain | awk -v b="refs/heads/$2" -v n="/$(agent_name "$2")" '
+    /^worktree / { w = substr($0, 10); c++; next }
+    /^branch / && c > 1 && ($2 == b || substr(w, length(w) - length(n) + 1) == n) { print w; exit }'
 }
 
 cmd_plan_status() {
@@ -993,10 +1055,7 @@ cmd_plan_status() {
     repo=$(cd "$repo" && git rev-parse --show-toplevel)
     if ((${#branches[@]})); then
       for b in "${branches[@]}"; do
-        # The checkout knows its worktrees; find_wt would ask herdr, which status never does.
-        p=$(git -C "$repo" worktree list --porcelain | awk -v b="refs/heads/$b" -v n="/$(agent_name "$b")" '
-          /^worktree / { w = substr($0, 10); c++; next }
-          /^branch / && c > 1 && ($2 == b || substr(w, length(w) - length(n) + 1) == n) { print w; exit }') || p=""
+        p=$(plan_wt_of "$repo" "$b") || p=""
         if [[ -n $p && -f $p/.herd/run/state ]]; then paths+=("$p"); else echo "herd: no plan run for $b" >&2; missing=1; fi
       done
     else
@@ -1788,8 +1847,9 @@ case ${1:-} in
       [[ -z $file ]] || read_targets "$file"
       [[ ${#targets[@]} -gt 0 ]] || die "done needs a branch or agent name (or -f file, or a Tasks.herd)"; cmd_done "${targets[@]}"; exit ;;
   plan) shift
-      # "status" is read before anything else, so it can never be taken for a branch of that name.
+      # "status" and "stop" are read before anything else, so they can never be taken for a branch.
       if [[ ${1:-} == status ]]; then shift; cmd_plan_status "$@"; exit; fi
+      if [[ ${1:-} == stop ]]; then shift; cmd_plan_stop "$@"; exit; fi
       resume=0 plan_verify="" bg_wait_opt=""
       while getopts "r:b:k:m:p:P:v:W:nRh" o; do case $o in
         r) repo=$OPTARG;; b) base=$OPTARG;; k) kind=$OPTARG;; m) machine=$OPTARG;; p) parent=$OPTARG;;
