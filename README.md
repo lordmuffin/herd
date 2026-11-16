@@ -261,6 +261,69 @@ land in the PR. `herd done <branch>` cleans up as usual once it merges. `verify:
 unattended in the worktree, outside the agent's permission prompts. The planner writes them,
 so read them with `-n` when that matters. `herd plan` runs on this machine only (no `-m`).
 
+### Plan status
+
+```bash
+herd plan status                     # this repo's plan runs, as a table
+herd plan status --json              # the same as one JSON object
+herd plan status --json feat/x       # only these branches
+herd plan status --json --all        # every run under ~/git/wt/*/*/
+```
+
+`status` is read first, so it can never be taken for a branch called "status". It only reads
+`.herd/run/`: besides `state` herd writes `events.ndjson` (an append-only log, one JSON object per
+line: `at`, `stage`, `event`, `status`, optional `msg`), `driver` (`pid`, `host`, `started`, and a
+`heartbeat` rewritten every 30 s while herd runs; removed when it exits) and, on a finished last
+stage, `pr` (`pr_number`, `pr_url`). It never calls the forge, and touches herdr only for
+`agent get`, once per unfinished run, cut off after 3 s. Runs are sorted by `updated_at`, newest
+first. An unknown branch is noted on stderr and makes the exit status 1; a run that can't be
+read is listed with an `error` and whatever could be read.
+
+`--json` prints one object. This is a contract: fields are added, never renamed or removed, and
+`version` changes only on a breaking change.
+
+```json
+{
+  "version": 1,
+  "host": "agentbox",
+  "plans": [{
+    "branch": "feat/x", "agent": "feat-x",
+    "worktree": "/home/u/git/wt/tether/feat-x", "repo": "tether",
+    "status": "fixing", "stage": 2, "total": 4,
+    "persona": "engineer", "kind": "claude", "base": "origin/main", "verify": "make test",
+    "started_at": "2026-11-16T10:00:00Z", "updated_at": "2026-11-16T10:42:10Z",
+    "driver": {"alive": true, "pid": 4242, "host": "agentbox", "heartbeat_at": "2026-11-16T10:42:00Z"},
+    "agent_status": "working",
+    "stopped": null,
+    "ready": false,
+    "pr": {"number": 17, "url": "https://git.apj.dev/o/r/pulls/17"},
+    "stages": [{
+      "n": 1, "title": "Backend", "verify": "make test", "status": "verified",
+      "started_at": "...", "ended_at": "...", "attempts": 1,
+      "gate": {"ok": true, "at": "...", "message": null},
+      "progress": "markdown of PROGRESS.md's \"## Stage 1\" section, without its heading, cut to 16 KiB"
+    }],
+    "last_event": {"at": "...", "event": "gate_fail", "msg": "..."}
+  }]
+}
+```
+
+- `status` is the run's: `planning`, `replanning`, `pending`, `running`, `fixing`, `blocked`,
+  `failed`, `verified` or `complete`. A stage's `status` is `verified` before `stage`, the run's
+  `status` at `stage`, and `pending` after it. While planning, `stages` is `[]` and `total` is 0.
+- `driver.alive` is true only when `driver` exists, its `host` is this host, its `pid` is alive
+  and a `herd` process, and its heartbeat is under 120 s old. Without a `driver` file it is
+  false and the other `driver` fields are null.
+- `agent_status` is herdr's status for the agent, or null when herdr isn't running or doesn't
+  know it.
+- `ready` is true for a `-n` run that has planned and stopped: stage 1, `pending`, no live
+  driver, and the last event is `dry_stop`.
+- `stopped` is the reason on a `STOPPED:` line in `PROGRESS.md`, or null.
+- `started_at`, `updated_at`, a stage's times, `attempts` (stage prompts plus fix-ups), `gate`
+  (the last gate result) and `last_event` come from `events.ndjson`. Without it they are null,
+  and `started_at`/`updated_at` fall back to the mtime of `state`. A broken line in the log is
+  skipped.
+
 **Running unattended.** A plan only runs on its own if its agent doesn't stop to ask
 permission. Under Claude's default mode, the first shell command that isn't on its allowlist
 blocks the stage, and herd stops there and waits for `-R`. Pass the agent a permission mode

@@ -15,8 +15,9 @@ test:
 	bash -n plugin/herd-plugin.sh
 	bash -n plugin/dashboard.sh
 	python3 -m py_compile serve/herd_serve.py
-	shellcheck -S warning bin/herd plugin/herd-plugin.sh plugin/dashboard.sh tests/plan.sh tests/worktree.sh tests/pr.sh tests/args.sh tests/version.sh tests/plugin.sh tests/status.sh tests/serve.sh tests/desktop.sh packaging/release-assets.sh
+	shellcheck -S warning bin/herd plugin/herd-plugin.sh plugin/dashboard.sh tests/plan.sh tests/plan_status.sh tests/worktree.sh tests/pr.sh tests/args.sh tests/version.sh tests/plugin.sh tests/status.sh tests/serve.sh tests/desktop.sh packaging/release-assets.sh
 	bash tests/plan.sh
+	bash tests/plan_status.sh
 	bash tests/worktree.sh
 	bash tests/pr.sh
 	bash tests/args.sh
