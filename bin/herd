@@ -440,7 +440,7 @@ create_agent() {
   fi
   wt_pane=$(jq -r '.result.root_pane.pane_id' <<<"$out")
 
-  h agent start "$wt_name" --kind "$kind" --pane "$wt_pane" --timeout 90000 -- "${agent_args[@]}" >/dev/null \
+  h agent start "$wt_name" --kind "$kind" --pane "$wt_pane" --timeout "$(( ${HERD_START_WAIT:-90} * 1000 ))" -- "${agent_args[@]}" >/dev/null \
     || die "agent start failed for $wt_name (pane $wt_pane) — inspect with: $(read_hint "$wt_name")"
 }
 
@@ -1372,7 +1372,7 @@ hd_start() {
     sleep 1
   done
   if ((asked)); then echo "herd: nobody answered $name's trust question in time" >&2
-  else echo "herd: $name did not report a status within $((ms / 1000))s (a login prompt?)" >&2; fi
+  else echo "herd: $name did not report a status within $((ms / 1000))s (a login or update prompt? a slow start? HERD_START_WAIT sets the seconds)" >&2; fi
   return 1
 }
 
