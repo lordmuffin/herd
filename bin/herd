@@ -18,6 +18,14 @@
 #                                     # waited out before the gate, up to -W minutes (default 60).
 #                                     # A "STOPPED: reason" line in PROGRESS.md stops the run at once
 #   herd plan -R <branch>             # resume a plan stopped by a block, a failed gate or ^C
+#   herd plan status [--json] [--all | <branch>...]
+#                                     # read-only view of plan runs: a table, or with --json one
+#                                     # versioned JSON object (see README, "Plan status"); --all
+#                                     # covers every run under ~/git/wt/*/*/
+#   herd plan stop [--kill] <branch> [reason...]
+#                                     # append "STOPPED: reason" to the run's PROGRESS.md, so the
+#                                     # driver stops at the end of the agent's turn; --kill also
+#                                     # signals the driver
 #   herd draft [-o file] [-F] <goal|file|->
 #                                     # turn a goal into a task file: a read-only dispatcher agent
 #                                     # reads the repo and writes one "branch @persona: prompt" line
@@ -455,6 +463,9 @@ spawn() {
 # State lives in <worktree>/.herd/run/ (git-ignored through info/exclude):
 #   plan.md      the plan as given          stages.md  "## Stage N: title" sections
 #   PROGRESS.md  the agents' handoff notes  state      stage + status, so -R can resume
+#   events.ndjson  append-only log of the run, one JSON object per line
+#   driver       pid, host, started and heartbeat of the herd process driving the run (while it lives)
+#   pr           pr_number= and pr_url= of the final PR, once the last stage's check found it
 
 # Prints a field of stage $2 from stages file $1: title, verify or body; or, with $2=0, the count.
 # The first "verify:" line of a stage is its verify command, and is not part of its body.
@@ -485,6 +496,49 @@ save_state() {
     verify "$plan_verify" base "$base" bgwait "$bg_wait" >"$run/state"
 }
 
+# Appends one event to events.ndjson: plan_event <event> [msg]. A failed write never stops the run.
+plan_event() {
+  jq -nc --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg stage "$stage" --arg event "$1" \
+        --arg status "$status" --arg msg "${2:-}" \
+        '{at: $at, stage: ($stage | tonumber), event: $event, status: $status}
+         + (if $msg == "" then {} else {msg: $msg} end)' >>"$run/events.ndjson" 2>/dev/null || true
+}
+
+# Writes the driver file atomically: driver_write [started]; heartbeat is always now.
+driver_write() {
+  local now; now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  printf '%s=%s\n' pid "$$" host "$(hostname -s 2>/dev/null)" started "${driver_started:-$now}" \
+    heartbeat "$now" >"$run/driver.tmp.$$" 2>/dev/null && mv -f "$run/driver.tmp.$$" "$run/driver" 2>/dev/null || true
+}
+
+driver_stop() {
+  [[ -z ${driver_hb:-} ]] || { kill "$driver_hb" 2>/dev/null || true; wait "$driver_hb" 2>/dev/null || true; driver_hb=""; }
+  [[ -z ${driver_started:-} ]] || { rm -f "$run/driver" "$run/driver.tmp.$$" 2>/dev/null || true; driver_started=""; }
+}
+
+# Marks this process as the run's driver and keeps heartbeat= fresh every HERD_HEARTBEAT seconds
+# (default 30, 0 turns the beat off) while this process lives. Exits through die, status 1 and 3,
+# and INT/TERM all remove the file. The beat's output is closed so $(...) never waits on it.
+driver_start() {
+  [[ -z ${driver_started:-} ]] || return 0
+  driver_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  driver_write
+  trap driver_stop EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  local every=${HERD_HEARTBEAT:-30} parent=$$
+  [[ $every =~ ^[0-9]+$ ]] || every=30
+  ((every > 0)) || return 0
+  (
+    while kill -0 "$parent" 2>/dev/null; do
+      command sleep "$every"
+      [[ -f $run/driver ]] || exit 0
+      driver_write
+    done
+  ) >/dev/null 2>&1 </dev/null &
+  driver_hb=$!
+}
+
 load_state() {
   local k v
   while IFS='=' read -r k v; do
@@ -510,6 +564,7 @@ await_agent() {
   if [[ $s == blocked ]]; then
     # Planning and fix-up keep their status, so -R re-checks the same thing (and spends no extra retry).
     [[ $status != running ]] || { status=blocked; save_state; }
+    plan_event blocked
     echo "herd: $wt_name is blocked $(if ((stage)); then echo "in stage $stage"; else echo "while planning"; fi)" \
       "— answer it in its pane, then: herd plan -R $plan_branch" >&2
     return 1
@@ -541,6 +596,7 @@ check_stopped() {
   local line
   line=$(grep -m1 '^STOPPED:' "$run/PROGRESS.md" 2>/dev/null) || return 0
   save_state
+  plan_event stopped "$line"
   echo "herd: stage $stage stopped the run — $line" >&2
   echo "herd: deal with it, delete that line from $run/PROGRESS.md, then: herd plan -R $plan_branch" >&2
   exit 1
@@ -558,6 +614,7 @@ await_stage() {
     bg_busy || return 0
     if ((SECONDS - start >= bg_wait * 60)); then
       save_state
+      plan_event bg_timeout
       echo "herd: stage $stage still has background work running after $bg_wait min — check its pane," \
         "then: herd plan -R $plan_branch (-W sets the wait)" >&2
       exit 3
@@ -635,8 +692,10 @@ EOF
 # (no gh, no fj login, the call failed) it is skipped with a note on stderr, not failed.
 stage_pr_msg() {
   local into=${base#origin/} err rc
-  err=$(pr_lookup "$into" "$plan_branch" 2>&1 >/dev/null); rc=$?
+  err=$(pr_lookup "$into" "$plan_branch" 2>&1); rc=$?
   case $rc in
+    0) printf 'pr_number=%s\npr_url=%s\n' "$(jq -r .number <<<"$err" 2>/dev/null)" "$(jq -r .html_url <<<"$err" 2>/dev/null)" \
+         >"$run/pr" 2>/dev/null || true ;;
     1) printf -- '- There is no PR from %s into %s.' "$plan_branch" "$into" ;;
     2) echo "  could not check the PR, so not gating on it: $err" >&2 ;;
   esac
@@ -676,17 +735,22 @@ planner_gate() {
 # interrupt, a blocked agent or a failed gate can all be picked up with -R.
 drive_plan() {
   local v last
+  driver_start
   if [[ $status == planning || $status == replanning ]]; then
     await_agent || exit 3
     if ! planner_gate; then
-      [[ $status == planning ]] || { status=failed; save_state; die "planner did not write usable stages:"$'\n'"$gate_msg"; }
+      [[ $status == planning ]] || { status=failed; save_state; plan_event failed "$gate_msg"; die "planner did not write usable stages:"$'\n'"$gate_msg"; }
       status=replanning; save_state
       send_prompt "$wt_name" "herd could not use your stages file:"$'\n'"$gate_msg"$'\n'"Write it in the format you were given, then stop."
       drive_plan; return
     fi
     stage=1 status=pending; save_state
+    plan_event planned "$(stage_field "$run/stages.md" 0)"
     echo "planned $(stage_field "$run/stages.md" 0) stage(s):"; stage_table "$run/stages.md" | sed 's/^/  /'
-    if ((dry)); then echo "stopping before stage 1 (-n); edit $run/stages.md if you like, then: herd plan -R $plan_branch"; exit; fi
+    if ((dry)); then
+      plan_event dry_stop
+      echo "stopping before stage 1 (-n); edit $run/stages.md if you like, then: herd plan -R $plan_branch"; exit
+    fi
   fi
 
   total=$(stage_field "$run/stages.md" 0)
@@ -699,27 +763,31 @@ drive_plan() {
         fresh_session
         status=running; save_state
         send_prompt "$wt_name" "$(compose "$persona" "$(stage_prompt "$v" "$last")")"
+        plan_event stage_start
         echo "stage $stage/$total: $(stage_field "$run/stages.md" "$stage" title)" ;;
     esac
     # running, fixing, blocked or failed: let the turn and its background work end, then check.
     await_stage
     if stage_gate "$v" "$last"; then
-      status=verified; save_state; echo "  stage $stage verified"; continue
+      status=verified; save_state; plan_event verified; echo "  stage $stage verified"; continue
     fi
     # The gate can take a while. If the agent started more background work meanwhile, wait again
     # rather than send (or count) a fix-up turn against work still in flight.
     if bg_busy; then continue; fi
+    plan_event gate_fail "$(tail -c 8192 <<<"$gate_msg")"
     if [[ $status == fixing ]]; then
       status=failed; save_state
+      plan_event failed "$gate_msg"
       echo "herd: stage $stage still fails after a fix-up turn:" >&2; sed 's/^/    /' <<<"$gate_msg" >&2
       echo "herd: fix it in the pane (or edit $run/stages.md), then: herd plan -R $plan_branch" >&2
       exit 1
     fi
     echo "  stage $stage not done yet, sending a fix-up turn:"; sed 's/^/    /' <<<"$gate_msg"
     status=fixing; save_state
+    plan_event fixup
     send_prompt "$wt_name" "Stage $stage of $total is not done yet. herd checked and found:"$'\n\n'"$gate_msg"$'\n'"Fix these, then make sure the \"## Stage $stage\" section of .herd/run/PROGRESS.md is up to date, and stop. Don't end the turn while a job, Monitor or eval you started is still running."
   done
-  status=complete; save_state
+  status=complete; save_state; (stage=$total; plan_event complete)
   echo "plan complete: $total stage(s) on $plan_branch. After the PR merges: herd done $plan_branch"
 }
 
@@ -727,7 +795,7 @@ cmd_plan() {
   [[ -z $machine ]] || die "plan runs its checks in the worktree, so it works on this machine only (no -m)"
   [[ -n $repo ]] || repo=$(git rev-parse --show-toplevel)
   repo=$(cd "$repo" && git rev-parse --show-toplevel)
-  local text staged=0 tmp
+  local text staged=0 tmp line
   if ((resume)); then
     find_wt "$plan_branch" || exit 1
     wt_name=$(agent_name "$plan_branch") wt_path=$path run="$path/.herd/run"
@@ -735,6 +803,11 @@ cmd_plan() {
     load_state
     bg_wait=${bg_wait_opt:-$bg_wait}   # -W on a resume overrides the saved wait
     [[ $status != complete ]] || { echo "plan on $plan_branch is already complete"; return; }
+    if line=$(grep -m1 '^STOPPED:' "$run/PROGRESS.md" 2>/dev/null); then
+      echo "herd: PROGRESS.md still has a STOPPED line, the run will stop again at once: $line" >&2
+      echo "herd: delete that line from $run/PROGRESS.md to carry on" >&2
+    fi
+    plan_event resume
     echo "resuming $plan_branch at stage $stage ($status)"
     drive_plan; return
   fi
@@ -774,6 +847,7 @@ cmd_plan() {
     send_prompt "$wt_name" "$(compose planner "$(planner_prompt)")"
     echo "planning: the planner is splitting the plan into stages"
   fi
+  plan_event start "$plan_branch"
   drive_plan
 }
 
@@ -785,6 +859,219 @@ plan_label() {
   if [[ $st == complete ]]; then echo complete; return; fi
   if [[ -f $r/stages.md ]]; then n=$(stage_field "$r/stages.md" 0); else n="?"; fi
   if [[ ${s:-0} == 0 ]]; then echo "$st"; else echo "stage $s/$n $st"; fi
+}
+
+# --- herd plan status: read-only view of plan runs --------------------------------------------
+# Reads <worktree>/.herd/run (state, stages.md, events.ndjson, driver, pr, PROGRESS.md) and prints
+# one JSON object (--json; the schema is the contract in the README) or a short table. Never
+# writes, and never touches herdr except `agent get` once per run, cut off after 3s.
+
+# True if pid $1 is alive and is a herd process.
+plan_pid_is_herd() {
+  [[ $1 =~ ^[0-9]+$ ]] && kill -0 "$1" 2>/dev/null || return 1
+  if [[ -r /proc/$1/cmdline ]]; then tr '\0' ' ' <"/proc/$1/cmdline" | grep -q herd
+  else ps -p "$1" -o command= 2>/dev/null | grep -q herd; fi
+}
+
+# The agent's status from `h agent get` with a 3s cap; prints nothing when herdr can't say.
+plan_agent_status() {
+  local out p w
+  out=$(mktemp "${TMPDIR:-/tmp}/herd-ps.XXXXXX")
+  { h agent get "$1" >"$out" 2>/dev/null; } &
+  p=$!
+  { command sleep 3; pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; } >/dev/null 2>&1 &
+  w=$!
+  wait "$p" 2>/dev/null || true
+  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
+  jq -r '.result.agent.agent_status // empty' "$out" 2>/dev/null || true
+  rm -f "$out"
+}
+
+# "## Stage $2" section of PROGRESS.md $1 without its heading, cut to 16 KiB.
+plan_progress_section() {
+  awk -v want="$2" '
+    /^## / { insec = ($0 ~ "^## Stage " want "([^0-9]|$)"); if (insec) found = 1; next }
+    insec { print }' "$1" 2>/dev/null | head -c 16384 || true
+}
+
+# One run's JSON object on stdout. $1 is the worktree, which holds .herd/run.
+plan_status_one() {
+  local d=${1%/} r err="" st="" stg="" per="" knd="" bs="" ver="" k v tmp n total i title sv
+  local host="" hb="" dpid="" proc_ok=false pn="" pu="" stopped="" astatus="" mtime branch
+  r=$d/.herd/run
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/herd-ps.XXXXXX")
+  branch=$(git -C "$d" symbolic-ref -q --short HEAD 2>/dev/null) || branch=$(basename "$d")
+  if [[ -r $r/state ]]; then
+    while IFS='=' read -r k v; do
+      case $k in stage) stg=$v ;; status) st=$v ;; persona) per=$v ;; kind) knd=$v ;; verify) ver=$v ;; base) bs=$v ;; esac
+    done <"$r/state" 2>/dev/null || true
+    [[ -n $st ]] || err="state has no status"
+  else err="cannot read $r/state"; fi
+  [[ $stg =~ ^[0-9]+$ ]] || { [[ -n $err ]] || err="state has no stage"; stg=0; }
+  mtime=$(date -u -r "$r/state" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  : >"$tmp/ev"; : >"$tmp/stages"
+  [[ ! -r $r/events.ndjson ]] || jq -cR 'try (fromjson | select(type == "object")) catch empty' "$r/events.ndjson" >"$tmp/ev" 2>/dev/null || true
+  local hasev=false; [[ ! -s $tmp/ev ]] || hasev=true
+  total=0
+  if [[ -r $r/stages.md ]]; then
+    total=$(stage_field "$r/stages.md" 0 2>/dev/null) || total=0
+    [[ $total =~ ^[0-9]+$ ]] || total=0
+    for ((i = 1; i <= total; i++)); do
+      title=$(stage_field "$r/stages.md" "$i" title); sv=$(stage_field "$r/stages.md" "$i" verify)
+      if [[ -r $r/PROGRESS.md ]] && grep -Eq "^## Stage $i([^0-9]|$)" "$r/PROGRESS.md" 2>/dev/null; then
+        plan_progress_section "$r/PROGRESS.md" "$i" >"$tmp/prog"
+      else : >"$tmp/prog"; fi
+      jq -nc --argjson n "$i" --arg t "$title" --arg v "${sv:-$ver}" --rawfile p "$tmp/prog" --argjson hp "$([[ -r $r/PROGRESS.md ]] && grep -Eq "^## Stage $i([^0-9]|$)" "$r/PROGRESS.md" 2>/dev/null && echo true || echo false)" \
+        '{n: $n, title: $t, verify: (if $v == "" then null else $v end), progress: (if $hp then $p else null end)}' >>"$tmp/stages"
+    done
+  fi
+  [[ -r $r/driver ]] && while IFS='=' read -r k v; do
+    case $k in pid) dpid=$v ;; host) host=$v ;; heartbeat) hb=$v ;; esac
+  done <"$r/driver" 2>/dev/null || true
+  if [[ -n $dpid ]] && plan_pid_is_herd "$dpid"; then proc_ok=true; fi
+  if [[ -r $r/pr ]]; then
+    while IFS='=' read -r k v; do case $k in pr_number) pn=$v ;; pr_url) pu=$v ;; esac; done <"$r/pr" 2>/dev/null || true
+  fi
+  stopped=$(grep -m1 '^STOPPED:' "$r/PROGRESS.md" 2>/dev/null | sed 's/^STOPPED:[[:space:]]*//') || true
+  [[ -z $st || $st == complete ]] || astatus=$(plan_agent_status "$(agent_name "$branch")")
+
+  jq -nc --arg branch "$branch" --arg agent "$(agent_name "$branch")" --arg wt "$d" \
+    --arg repo "$(basename "$(dirname "$d")")" --arg status "$st" --argjson stage "$stg" --argjson total "$total" \
+    --arg persona "$per" --arg kind "$knd" --arg base "$bs" --arg verify "$ver" --arg mtime "$mtime" \
+    --arg dhost "$host" --arg dpid "$dpid" --arg dhb "$hb" --argjson dproc "$proc_ok" --arg me "$(hostname -s 2>/dev/null)" \
+    --arg astatus "$astatus" --arg stopped "$stopped" --arg pn "$pn" --arg pu "$pu" --arg err "$err" \
+    --argjson hasev "$hasev" --slurpfile ev "$tmp/ev" --slurpfile sd "$tmp/stages" '
+    def nul: if . == "" then null else . end;
+    ($ev) as $E
+    | ($dhb | nul) as $hbv
+    | (if $dhb == "" then null else (try ($dhb | fromdateiso8601) catch null) end) as $hbt
+    | ($hbt != null and $dproc and $dhost == $me and ((now - $hbt) < 120)) as $alive
+    | ($E | last // null) as $le
+    | ($stage == 1 and $status == "pending" and ($alive | not) and ($le.event? == "dry_stop")) as $ready
+    | {branch: $branch, agent: $agent, worktree: $wt, repo: $repo,
+       status: ($status | nul), stage: $stage, total: $total,
+       persona: ($persona | nul), kind: ($kind | nul), base: ($base | nul), verify: ($verify | nul),
+       started_at: (($E | first // null | .at?) // $mtime), updated_at: (($le | .at?) // $mtime),
+       driver: (if $dpid == "" and $dhb == "" then {alive: false, pid: null, host: null, heartbeat_at: null}
+                else {alive: $alive, pid: (try ($dpid | tonumber) catch null), host: ($dhost | nul), heartbeat_at: $hbv} end),
+       agent_status: ($astatus | nul), stopped: ($stopped | nul), ready: $ready,
+       pr: (if $pu == "" and $pn == "" then null else {number: (try ($pn | tonumber) catch null), url: ($pu | nul)} end),
+       stages: [$sd[] | . as $s | ($E | map(select(.stage == $s.n))) as $en
+         | ($en | map(select(.event == "verified")) | last) as $ver
+         | ($en | map(select(.event == "gate_fail" or .event == "verified" or .event == "failed")) | last) as $g
+         | {n: $s.n, title: $s.title, verify: $s.verify,
+            status: (if $s.n < $stage then "verified" elif $s.n == $stage then $status else "pending" end),
+            started_at: ($en | map(select(.event == "stage_start")) | first | .at?),
+            ended_at: ($ver | .at?),
+            attempts: (if $hasev then ($en | map(select(.event == "stage_start" or .event == "fixup")) | length) else null end),
+            gate: (if $g == null then null else {ok: ($g.event == "verified"), at: $g.at, message: ($g.msg // null)} end),
+            progress: $s.progress}],
+       last_event: (if $le == null then null else {at: $le.at, event: $le.event, msg: ($le.msg // null)} end)}
+    + (if $err == "" then {} else {error: $err} end)'
+  rm -rf "$tmp"
+}
+
+# herd plan stop [--kill] [-r repo] <branch> [reason...]: appends "STOPPED: reason" to the run's
+# PROGRESS.md (once), which the driver picks up when the agent's turn ends, as if a stage had
+# written it. --kill also TERMs a live driver (the one in `driver`), and logs a stopped event.
+cmd_plan_stop() {
+  local kill=0 words=() b p r reason dpid="" dhost="" k v line
+  while (($#)); do
+    case $1 in
+      --kill) kill=1 ;;
+      -r) [[ $# -ge 2 ]] || die "plan stop: -r needs a repo"; repo=$2; shift ;;
+      -h|--help) usage; return ;;
+      --) shift; words+=("$@"); break ;;
+      -*) die "plan stop: unknown option $1" ;;
+      *) words+=("$1") ;;
+    esac; shift
+  done
+  [[ ${#words[@]} -ge 1 ]] || die "plan stop needs a branch: herd plan stop [--kill] <branch> [reason...]"
+  b=${words[0]}; reason="${words[*]:1}"
+  [[ -n ${reason//[[:space:]]/} ]] || reason="stopped by herd plan stop"
+  [[ -n $repo ]] || repo=$(git rev-parse --show-toplevel)
+  repo=$(cd "$repo" && git rev-parse --show-toplevel)
+  p=$(plan_wt_of "$repo" "$b") || p=""
+  [[ -n $p && -f $p/.herd/run/state ]] || die "no plan run for $b"
+  r=$p/.herd/run
+  if line=$(grep -m1 '^STOPPED:' "$r/PROGRESS.md" 2>/dev/null); then
+    echo "already stopped: $line"
+  else
+    printf 'STOPPED: %s\n' "${reason//$'\n'/ }" >>"$r/PROGRESS.md" || die "cannot write $r/PROGRESS.md"
+    echo "stopped $b: the driver ends the run when the agent's turn ends (herd plan -R $b resumes, after deleting that line)"
+  fi
+  ((kill)) || return 0
+  [[ -r $r/driver ]] && while IFS='=' read -r k v; do
+    case $k in pid) dpid=$v ;; host) dhost=$v ;; esac
+  done <"$r/driver" 2>/dev/null
+  if [[ -n $dpid && $dhost == "$(hostname -s 2>/dev/null)" ]] && plan_pid_is_herd "$dpid"; then
+    run=$r stage=$(sed -n 's/^stage=//p' "$r/state") status=$(sed -n 's/^status=//p' "$r/state")
+    [[ $stage =~ ^[0-9]+$ ]] || stage=0
+    plan_event stopped "killed driver $dpid: $reason"
+    kill "$dpid" 2>/dev/null || die "could not signal driver $dpid"
+    echo "sent TERM to the driver (pid $dpid)"
+  else echo "no live driver to kill"; fi
+}
+
+# A time like 2026-11-16T10:42:10Z as "5m ago", for the table.
+plan_status_table() {
+  jq -r 'def ago: ([now - (try fromdateiso8601 catch now), 0] | max) as $s
+           | if $s < 60 then "\($s | floor)s ago" elif $s < 3600 then "\($s / 60 | floor)m ago"
+             elif $s < 86400 then "\($s / 3600 | floor)h ago" else "\($s / 86400 | floor)d ago" end;
+         ["BRANCH", "STAGE", "STATUS", "DRIVER", "UPDATED"],
+         (.plans[] | [.branch, (if .total > 0 then "\([.stage, .total] | min)/\(.total)" else "-" end),
+                      (.status // "?") + (if .error then " (" + .error + ")" else "" end),
+                      (if .driver.alive then "alive" else "no driver" end), (.updated_at | ago)]) | @tsv' "$1" | column -t -s $'\t'
+}
+
+# The worktree of <branch> (by branch or agent-name path suffix) from the checkout's own
+# worktree list; find_wt would ask herdr, which status and stop never do.
+plan_wt_of() {
+  git -C "$1" worktree list --porcelain | awk -v b="refs/heads/$2" -v n="/$(agent_name "$2")" '
+    /^worktree / { w = substr($0, 10); c++; next }
+    /^branch / && c > 1 && ($2 == b || substr(w, length(w) - length(n) + 1) == n) { print w; exit }'
+}
+
+cmd_plan_status() {
+  local json=0 all=0 branches=() b d p missing=0 paths=() out tmp
+  while (($#)); do
+    case $1 in
+      --json) json=1 ;; --all) all=1 ;;
+      -r) [[ $# -ge 2 ]] || die "plan status: -r needs a repo"; repo=$2; shift ;;
+      -h|--help) usage; return ;;
+      --) shift; branches+=("$@"); break ;;
+      -*) die "plan status: unknown option $1" ;;
+      *) branches+=("$1") ;;
+    esac; shift
+  done
+  ((!all)) || [[ ${#branches[@]} -eq 0 ]] || die "plan status: --all and branches don't mix"
+  if ((all)); then
+    for d in "$HOME"/git/wt/*/*/; do
+      if [[ -f ${d}.herd/run/state ]]; then paths+=("${d%/}"); fi
+    done
+  else
+    [[ -n $repo ]] || repo=$(git rev-parse --show-toplevel)
+    repo=$(cd "$repo" && git rev-parse --show-toplevel)
+    if ((${#branches[@]})); then
+      for b in "${branches[@]}"; do
+        p=$(plan_wt_of "$repo" "$b") || p=""
+        if [[ -n $p && -f $p/.herd/run/state ]]; then paths+=("$p"); else echo "herd: no plan run for $b" >&2; missing=1; fi
+      done
+    else
+      while IFS= read -r p; do
+        if [[ -f $p/.herd/run/state ]]; then paths+=("$p"); fi
+      done < <(git -C "$repo" worktree list --porcelain | awk '/^worktree /{n++; if (n > 1) print substr($0, 10)}')
+    fi
+  fi
+  tmp=$(mktemp "${TMPDIR:-/tmp}/herd-ps.XXXXXX")
+  for p in ${paths[@]+"${paths[@]}"}; do plan_status_one "$p" || true; done |
+    jq -sc --arg h "$(hostname -s 2>/dev/null)" '{version: 1, host: $h, plans: (sort_by(.updated_at) | reverse)}' >"$tmp"
+  if ((json)); then cat "$tmp"
+  elif [[ $(jq '.plans | length' "$tmp") -eq 0 ]]; then echo "no plan runs"
+  else plan_status_table "$tmp"; fi
+  rm -f "$tmp"
+  return "$missing"
 }
 
 # A plan's stages and where it stopped, from <worktree>/.herd/run, as JSON: {status, stages: [{n,
@@ -1559,7 +1846,11 @@ case ${1:-} in
       shift $((OPTIND-1)); targets=("$@"); [[ -n $file || $# -gt 0 ]] || file=$(default_file)
       [[ -z $file ]] || read_targets "$file"
       [[ ${#targets[@]} -gt 0 ]] || die "done needs a branch or agent name (or -f file, or a Tasks.herd)"; cmd_done "${targets[@]}"; exit ;;
-  plan) shift; resume=0 plan_verify="" bg_wait_opt=""
+  plan) shift
+      # "status" and "stop" are read before anything else, so they can never be taken for a branch.
+      if [[ ${1:-} == status ]]; then shift; cmd_plan_status "$@"; exit; fi
+      if [[ ${1:-} == stop ]]; then shift; cmd_plan_stop "$@"; exit; fi
+      resume=0 plan_verify="" bg_wait_opt=""
       while getopts "r:b:k:m:p:P:v:W:nRh" o; do case $o in
         r) repo=$OPTARG;; b) base=$OPTARG;; k) kind=$OPTARG;; m) machine=$OPTARG;; p) parent=$OPTARG;;
         P) persona=$OPTARG;; v) plan_verify=$OPTARG;; W) bg_wait_opt=$OPTARG;; n) dry=1;; R) resume=1;;

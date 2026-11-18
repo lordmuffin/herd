@@ -135,5 +135,59 @@ check "stops with exit 1 and the line as the reason" \
 check "no fix-up turn, gate never ran" test "$(fixups)" -eq 0 -a "$(count "$T/verify.log")" -eq 0
 check "state keeps its status for -R" test "$(state status)" = running
 
+# --- the run record ------------------------------------------------------------------------------
+events() { jq -r '.event' "$run/events.ndjson" 2>/dev/null | paste -sd, -; }
+evmsg() { jq -r --arg e "$1" 'select(.event == $e).msg' "$run/events.ndjson"; }
+
+echo "events: first-try pass"
+setup; WORK_ON_PROMPT=1; plan_event start "$plan_branch"; run_plan
+check "start, stage_start, verified, complete in order" test "$(events)" = start,stage_start,verified,complete
+check "lines carry at (RFC3339 UTC), stage and status" \
+  test "$(jq -r 'select((.at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$")) and .stage == 1 and .status != null) | .event' "$run/events.ndjson" | wc -l | tr -d ' ')" -eq 4
+check "start carries the branch" test "$(evmsg start)" = feat/lab
+check "complete has no msg" test "$(jq -r 'select(.event == "complete") | has("msg")' "$run/events.ndjson")" = false
+
+echo "events: gate fails once"
+setup; WORK_ON_PROMPT=2; run_plan
+check "gate_fail, fixup, verified" test "$(events)" = stage_start,gate_fail,fixup,verified,complete
+check "gate_fail msg holds the gate's text" grep -q 'failed. The end of its output' <<<"$(evmsg gate_fail)"
+
+echo "events: fails twice"
+setup; run_plan
+check "failed carries the gate text" grep -q 'failed. The end of its output' <<<"$(evmsg failed)"
+
+echo "events: STOPPED"
+setup; STOP_ON_PROMPT=1; run_plan
+check "stopped carries the line" grep -q '^STOPPED: lab host unreachable' <<<"$(evmsg stopped)"
+
+echo "events: bg_timeout"
+setup; READS="busy"; bg_wait=0; run_plan
+check "bg_timeout is recorded" test "$(events)" = stage_start,bg_timeout
+
+echo "driver file"
+export HERD_HEARTBEAT=0
+h_src=$(declare -f h); eval "h_orig${h_src#h}"
+h() {   # snapshot the driver file when the stage prompt goes out
+  if [[ "$1 $2" == "agent prompt" && $4 != /clear ]]; then
+    [[ ! -f $run/driver ]] || cp "$run/driver" "$T/driver.seen"
+    [[ ${DIE_ON_PROMPT:-} != 1 ]] || die boom
+  fi
+  h_orig "$@"
+}
+setup; WORK_ON_PROMPT=1; run_plan
+check "driver existed while running, with pid host started heartbeat" \
+  eval 'for k in pid host started heartbeat; do grep -q "^$k=." "$T/driver.seen" || exit 1; done'
+check "driver is gone after drive_plan exits" test ! -e "$run/driver"
+setup; DIE_ON_PROMPT=1; run_plan
+check "driver existed, and is gone after die" test "$rc" -eq 1 -a -f "$T/driver.seen" -a ! -e "$run/driver"
+DIE_ON_PROMPT=0
+
+echo "driver heartbeat"
+setup
+check "heartbeat is rewritten while the driver lives, and stops with it" eval '
+  ( HERD_HEARTBEAT=1; driver_start
+    a=$(sed -n s/^heartbeat=//p "$run/driver"); command sleep 2.2
+    b=$(sed -n s/^heartbeat=//p "$run/driver"); [[ $a != "$b" ]] ) && [[ ! -e $run/driver ]]'
+
 echo "$pass passed, $fail failed"
 ((fail == 0))
