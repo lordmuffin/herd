@@ -1090,7 +1090,7 @@ plan_status_json() {
   done
 
   ((!files)) || LC_ALL=C awk "$plan_status_awk" "${awk_args[@]}" >>"$tmp/stream" 2>/dev/null || true
-  : >>"$tmp/stream" >>"$tmp/agents"
+  : >>"$tmp/stream"; : >>"$tmp/agents"
   ((!need_agents)) || plan_agent_list "$tmp/agents"
   if ! jq -nr -R --rawfile ag "$tmp/agents" --arg me "$me" --argjson nf "$plan_status_nf" "$plan_status_jq" \
          --args ${facts[@]+"${facts[@]}"} <"$tmp/stream" >"$tmp/out"; then
