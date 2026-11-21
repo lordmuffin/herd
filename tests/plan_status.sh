@@ -202,6 +202,33 @@ check "a missing run exits 1" eval '[[ $rc -eq 1 ]] && grep -q "no plan run for 
 run_stop
 check "no branch is a usage error" eval '[[ $rc -ne 0 ]] && grep -q "needs a branch" "$T/err"'
 
+echo "golden: --all over tests/plan_fixtures.sh's runs"
+# The JSON must stay byte for byte what tests/fixtures/plan_status.golden.json holds (made by the
+# implementation before the fast one), with the fixtures' home and this host's name masked.
+# HERD_GOLDEN_UPDATE=1 rewrites it instead, for a deliberate change to the output.
+G=$T/golden
+bash "$here/plan_fixtures.sh" "$G" >/dev/null 2>&1
+golden=$here/fixtures/plan_status.golden.json
+mkdir -p "$G/bin"
+cat >"$G/bin/herdr" <<'FAKE'
+#!/usr/bin/env bash
+echo "$*" >>"$HOME/calls"
+case "$1 $2" in
+  "agent list") cat "$HOME/agents.json" ;;
+  "agent get") jq -ce --arg n "$3" '{result: {agent: (.result.agents[] | select(.name == $n))}}' "$HOME/agents.json" ;;
+  *) exit 1 ;;
+esac
+FAKE
+chmod +x "$G/bin/herdr"
+gold() {
+  (export HOME=$G PATH=$G/bin:$PATH; cd "$G" && "$herd" plan status --json --all) 2>"$T/err" |
+    sed -e "s|$G|@HOME@|g" -e 's|^{"version":1,"host":"[^"]*"|{"version":1,"host":"@HOST@"|' >"$T/out"
+}
+gold
+if [[ -n ${HERD_GOLDEN_UPDATE:-} ]]; then cp "$T/out" "$golden"; echo "  (rewrote $golden)"; fi
+check "the first call matches the golden JSON" cmp -s "$T/out" "$golden"
+check "31 runs" eval '[[ $(jq ".plans | length" "$T/out") == 31 ]]'
+
 kill "$live"
 echo "$pass passed, $fail failed"
 ((fail == 0))
