@@ -466,6 +466,7 @@ spawn() {
 #   events.ndjson  append-only log of the run, one JSON object per line
 #   driver       pid, host, started and heartbeat of the herd process driving the run (while it lives)
 #   pr           pr_number= and pr_url= of the final PR, once the last stage's check found it
+#   status.json  herd plan status's cache of a finished run's object (see plan_status_json)
 
 # Prints a field of stage $2 from stages file $1: title, verify or body; or, with $2=0, the count.
 # The first "verify:" line of a stage is its verify command, and is not part of its body.
@@ -863,8 +864,17 @@ plan_label() {
 
 # --- herd plan status: read-only view of plan runs --------------------------------------------
 # Reads <worktree>/.herd/run (state, stages.md, events.ndjson, driver, pr, PROGRESS.md) and prints
-# one JSON object (--json; the schema is the contract in the README) or a short table. Never
-# writes, and never touches herdr except `agent get` once per run, cut off after 3s.
+# one JSON object (--json; the schema is the contract in the README) or a short table. It writes
+# only .herd/run/status.json, a finished run's cached object, and touches herdr only for one
+# `agent list` per call, cut off after 3s.
+#
+# tetherd polls it, so the cost per call is a fixed handful of processes (one find, one awk, one
+# jq, one herdr) plus a git per run that isn't cached, never one per field or stage: forks are
+# what costs on a loaded box.
+
+# Bump when the plan object changes, so status.json caches written before it are not reused.
+# plan_status_nocache=1 reads every run afresh, ignoring (but still writing) status.json.
+plan_status_cache_v=1 plan_status_nocache=""
 
 # True if pid $1 is alive and is a herd process.
 plan_pid_is_herd() {
@@ -873,103 +883,234 @@ plan_pid_is_herd() {
   else ps -p "$1" -o command= 2>/dev/null | grep -q herd; fi
 }
 
-# The agent's status from `h agent get` with a 3s cap; prints nothing when herdr can't say.
-plan_agent_status() {
-  local out p w
-  out=$(mktemp "${TMPDIR:-/tmp}/herd-ps.XXXXXX")
-  { h agent get "$1" >"$out" 2>/dev/null; } &
+# `h agent list` into file $1, cut off after 3s; the file is empty or partial when herdr can't say.
+plan_agent_list() {
+  local p w
+  { h agent list >"$1" 2>/dev/null; } &
   p=$!
   { command sleep 3; pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; } >/dev/null 2>&1 &
   w=$!
   wait "$p" 2>/dev/null || true
   kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
-  jq -r '.result.agent.agent_status // empty' "$out" 2>/dev/null || true
-  rm -f "$out"
 }
 
-# "## Stage $2" section of PROGRESS.md $1 without its heading, cut to 16 KiB.
-plan_progress_section() {
-  awk -v want="$2" '
-    /^## / { insec = ($0 ~ "^## Stage " want "([^0-9]|$)"); if (insec) found = 1; next }
-    insec { print }' "$1" 2>/dev/null | head -c 16384 || true
-}
+# One pass over every run's stages.md, PROGRESS.md and events.ndjson (operands "ri=<run>
+# kind=<stages|progress|events> <file>..."), as one JSON record per line for plan_status_jq:
+#   h  a "## Stage N" heading of stages.md, in order: its title     v  a stage's first verify: line
+#   p  PROGRESS.md's "## Stage <s>" sections, without headings, cut to 16 KiB (bytes: LC_ALL=C)
+#   s  PROGRESS.md's first STOPPED: reason                         e  an events.ndjson line, raw
+# The rules are stage_field's, and those of the grep, awk and head calls this pass replaced.
+plan_status_awk='
+  BEGIN { for (c = 1; c < 32; c++) ctl[sprintf("%c", c)] = sprintf("\\u%04x", c); ctl["\\"] = "\\\\"; ctl["\""] = "\\\"" }
+  function esc(s,   o) {
+    o = ""
+    while (match(s, /[\\"\001-\037]/)) { o = o substr(s, 1, RSTART - 1) ctl[substr(s, RSTART, 1)]; s = substr(s, RSTART + 1) }
+    return o s
+  }
+  function rec(k, rest) { printf "{\"i\":%d,\"k\":\"%s\"%s}\n", ri, k, rest }
+  FNR == 1 { n = 0; skipped = 0; sec = ""; stop = 0 }
+  kind == "stages" {
+    if (/^## Stage [0-9]+/) {
+      n++; skipped = 0; t = $0; sub(/^## Stage [0-9]+:?[ \t]*/, "", t); rec("h", ",\"t\":\"" esc(t) "\""); next
+    }
+    if (n && !skipped && /^verify:/) {
+      skipped = 1; v = $0; sub(/^verify:[ \t]*/, "", v); rec("v", ",\"n\":" n ",\"v\":\"" esc(v) "\"")
+    }
+    next
+  }
+  kind == "progress" {
+    if (!stop && /^STOPPED:/) { stop = 1; s = $0; sub(/^STOPPED:[[:space:]]*/, "", s); rec("s", ",\"v\":\"" esc(s) "\"") }
+    if (/^## /) {
+      sec = ""
+      if (match($0, /^## Stage [0-9]+/)) {
+        sec = substr($0, 10, RLENGTH - 9); k = ri SUBSEP sec
+        if (!(k in prog)) { prog[k] = ""; order[++np] = k }
+      }
+      next
+    }
+    if (sec != "" && length(prog[ri SUBSEP sec]) <= 16384) prog[ri SUBSEP sec] = prog[ri SUBSEP sec] $0 "\n"
+    next
+  }
+  kind == "events" { rec("e", ",\"l\":\"" esc($0) "\"") }
+  END {
+    for (j = 1; j <= np; j++) {
+      split(order[j], w, SUBSEP); ri = w[1]
+      rec("p", ",\"s\":\"" w[2] "\",\"p\":\"" esc(substr(prog[order[j]], 1, 16384)) "\"")
+    }
+  }'
 
-# One run's JSON object on stdout. $1 is the worktree, which holds .herd/run.
-plan_status_one() {
-  local d=${1%/} r err="" st="" stg="" per="" knd="" bs="" ver="" k v tmp n total i title sv
-  local host="" hb="" dpid="" proc_ok=false pn="" pu="" stopped="" astatus="" mtime branch
-  r=$d/.herd/run
+# Every run's plan object from plan_status_awk's records (stdin, raw lines), the facts bash read
+# (--args, plan_status_nf per run, in the order plan_status_json gives them) and herdr's agent list
+# ($ag). Prints the {version, host, plans} line, then "<run>\t<status.json line>" for each run to
+# cache and "<run>\tdrop" for a cache it could not read.
+plan_status_nf=19
+plan_status_jq='
+  def nul: if . == "" then null else . end;
+  def aname: ascii_downcase | gsub("[/._]"; "-") | gsub("[^a-z0-9_-]"; "") | sub("^[-_0-9]"; "") | .[0:32];
+  (try ($ag | fromjson) catch null) as $AL
+  | def astatus($a): [try ($AL.result.agents[] | select(.name == $a)) catch empty][0].agent_status // ""
+      | if type == "string" then . else tojson end;
+  (reduce (inputs | try fromjson catch empty) as $x ({}; .[$x.i | tostring] += [$x])) as $R
+  | $ARGS.positional as $A
+  | [range(0; $A | length; $nf) as $o | $A[$o:$o + $nf]
+    | . as [$wt, $repo, $key, $cached, $branch, $status, $stg, $persona, $kind, $base, $verify, $mt,
+            $dhost, $dpid, $dhb, $dp, $pn, $pu, $err]
+    | ($o / $nf | tostring) as $i
+    | ($R[$i] // []) as $rec
+    | if $cached != "" then
+        ([$rec[] | select(.k == "c") | .c][0]) as $c
+        | if ($c | type) != "object" then {i: $i, drop: true}
+          else {i: $i, plan: ($c.plan | .worktree = $wt | .repo = $repo
+                  | .agent_status = (if .status == null or .status == "complete" then null else (astatus(.agent) | nul) end))}
+          end
+      else
+        ($stg | tonumber) as $stage | ($dp == "true") as $dproc | ($branch | aname) as $agent
+        | (if ($mt | test("^-?[0-9]+$")) then $mt | tonumber | todate else $mt end) as $mtime
+        | [$rec[] | select(.k == "e") | .l | try (fromjson | select(type == "object")) catch empty] as $E
+        | ($E | length > 0) as $hasev
+        | [$rec[] | select(.k == "h") | .t] as $titles
+        | (reduce ($rec[] | select(.k == "v")) as $v ({}; .[$v.n | tostring] = $v.v)) as $V
+        | (reduce ($rec[] | select(.k == "p")) as $p ({}; .[$p.s] = $p.p)) as $P
+        | ([$rec[] | select(.k == "s") | .v][0] // "") as $stopped
+        | ($titles | length) as $total
+        | [range(1; $total + 1) as $n | ($V[$n | tostring] // "") as $sv
+           | {n: $n, title: $titles[$n - 1], verify: (if $sv == "" then $verify else $sv end | nul), progress: $P[$n | tostring]}] as $sd
+        | (if $status == "" or $status == "complete" then "" else astatus($agent) end) as $astatus
+        | ($dhb | nul) as $hbv
+        | (if $dhb == "" then null else (try ($dhb | fromdateiso8601) catch null) end) as $hbt
+        | ($hbt != null and $dproc and $dhost == $me and ((now - $hbt) < 120)) as $alive
+        | ($E | last // null) as $le
+        | ($stage == 1 and $status == "pending" and ($alive | not) and ($le.event? == "dry_stop")) as $ready
+        | ({branch: $branch, agent: $agent, worktree: $wt, repo: $repo,
+           status: ($status | nul), stage: $stage, total: $total,
+           persona: ($persona | nul), kind: ($kind | nul), base: ($base | nul), verify: ($verify | nul),
+           started_at: (($E | first // null | .at?) // $mtime), updated_at: (($le | .at?) // $mtime),
+           driver: (if $dpid == "" and $dhb == "" then {alive: false, pid: null, host: null, heartbeat_at: null}
+                    else {alive: $alive, pid: (try ($dpid | tonumber) catch null), host: ($dhost | nul), heartbeat_at: $hbv} end),
+           agent_status: ($astatus | nul), stopped: ($stopped | nul), ready: $ready,
+           pr: (if $pu == "" and $pn == "" then null else {number: (try ($pn | tonumber) catch null), url: ($pu | nul)} end),
+           stages: [$sd[] | . as $s | ($E | map(select(.stage == $s.n))) as $en
+             | ($en | map(select(.event == "verified")) | last) as $ver
+             | ($en | map(select(.event == "gate_fail" or .event == "verified" or .event == "failed")) | last) as $g
+             | {n: $s.n, title: $s.title, verify: $s.verify,
+                status: (if $s.n < $stage then "verified" elif $s.n == $stage then $status else "pending" end),
+                started_at: ($en | map(select(.event == "stage_start")) | first | .at?),
+                ended_at: ($ver | .at?),
+                attempts: (if $hasev then ($en | map(select(.event == "stage_start" or .event == "fixup")) | length) else null end),
+                gate: (if $g == null then null else {ok: ($g.event == "verified"), at: $g.at, message: ($g.msg // null)} end),
+                progress: $s.progress}],
+           last_event: (if $le == null then null else {at: $le.at, event: $le.event, msg: ($le.msg // null)} end)}
+          + (if $err == "" then {} else {error: $err} end)) as $plan
+        # Cache a finished run once nothing in it can change without one of its files changing: no
+        # live driver, and a heartbeat (if any) too old for one to come back. agent_status is
+        # asked again on every call.
+        | {i: $i, plan: $plan,
+           cache: (if $key != "" and $err == "" and ($status == "complete" or $status == "failed") and ($alive | not)
+                      and ($hbt == null or (now - $hbt) >= 120)
+                   then {key: $key, plan: $plan} else null end)}
+      end]
+  | ({version: 1, host: $me, plans: ([.[] | select(.plan) | .plan] | sort_by(.updated_at) | reverse)} | tojson),
+    (.[] | select(.cache) | "\(.i)\t\(.cache | tojson)"),
+    (.[] | select(.drop) | "\(.i)\tdrop")'
+
+# The {version, host, plans} object for the worktrees $@ (each holds .herd/run), on stdout.
+# A finished run is read from .herd/run/status.json while the files it came from (and the
+# worktree's HEAD, for the branch) keep the mtimes and sizes recorded in its key; GNU find
+# gives those, and where it can't (BSD) nothing is cached.
+plan_status_json() {
+  local me tmp d r i k v f g line key st stg per knd bs ver err host hb dpid proc_ok pn pu branch mt
+  local need_agents=0 files=0 c doc drops=() stats=() facts=() awk_args=() heads=()
+  local -A fst=()
+  me=$(hostname -s 2>/dev/null)
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/herd-ps.XXXXXX")
-  branch=$(git -C "$d" symbolic-ref -q --short HEAD 2>/dev/null) || branch=$(basename "$d")
-  if [[ -r $r/state ]]; then
-    while IFS='=' read -r k v; do
-      case $k in stage) stg=$v ;; status) st=$v ;; persona) per=$v ;; kind) knd=$v ;; verify) ver=$v ;; base) bs=$v ;; esac
-    done <"$r/state" 2>/dev/null || true
-    [[ -n $st ]] || err="state has no status"
-  else err="cannot read $r/state"; fi
-  [[ $stg =~ ^[0-9]+$ ]] || { [[ -n $err ]] || err="state has no stage"; stg=0; }
-  mtime=$(date -u -r "$r/state" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
-
-  : >"$tmp/ev"; : >"$tmp/stages"
-  [[ ! -r $r/events.ndjson ]] || jq -cR 'try (fromjson | select(type == "object")) catch empty' "$r/events.ndjson" >"$tmp/ev" 2>/dev/null || true
-  local hasev=false; [[ ! -s $tmp/ev ]] || hasev=true
-  total=0
-  if [[ -r $r/stages.md ]]; then
-    total=$(stage_field "$r/stages.md" 0 2>/dev/null) || total=0
-    [[ $total =~ ^[0-9]+$ ]] || total=0
-    for ((i = 1; i <= total; i++)); do
-      title=$(stage_field "$r/stages.md" "$i" title); sv=$(stage_field "$r/stages.md" "$i" verify)
-      if [[ -r $r/PROGRESS.md ]] && grep -Eq "^## Stage $i([^0-9]|$)" "$r/PROGRESS.md" 2>/dev/null; then
-        plan_progress_section "$r/PROGRESS.md" "$i" >"$tmp/prog"
-      else : >"$tmp/prog"; fi
-      jq -nc --argjson n "$i" --arg t "$title" --arg v "${sv:-$ver}" --rawfile p "$tmp/prog" --argjson hp "$([[ -r $r/PROGRESS.md ]] && grep -Eq "^## Stage $i([^0-9]|$)" "$r/PROGRESS.md" 2>/dev/null && echo true || echo false)" \
-        '{n: $n, title: $t, verify: (if $v == "" then null else $v end), progress: (if $hp then $p else null end)}' >>"$tmp/stages"
+  for d in "$@"; do
+    f=""
+    if [[ -f $d/.git ]]; then
+      line=""; read -r line <"$d/.git" || true
+      if [[ $line == "gitdir: "* ]]; then g=${line#gitdir: }; [[ $g == /* ]] || g=$d/$g; f=$g/HEAD; fi
+    elif [[ -d $d/.git ]]; then f=$d/.git/HEAD; fi
+    heads+=("$f")
+    for f in "$f" "$d"/.herd/run/{state,stages.md,PROGRESS.md,events.ndjson,driver,pr}; do
+      [[ -z $f || ! -e $f ]] || stats+=("$f")
     done
+  done
+  if ((${#stats[@]})); then
+    while IFS= read -r -d '' line; do
+      k=${line#* }; v=${k#* }; fst[$v]="${line%% *} ${k%% *}"
+    done < <(find "${stats[@]}" -maxdepth 0 -printf '%T@ %s %p\0' 2>/dev/null)
   fi
-  [[ -r $r/driver ]] && while IFS='=' read -r k v; do
-    case $k in pid) dpid=$v ;; host) host=$v ;; heartbeat) hb=$v ;; esac
-  done <"$r/driver" 2>/dev/null || true
-  if [[ -n $dpid ]] && plan_pid_is_herd "$dpid"; then proc_ok=true; fi
-  if [[ -r $r/pr ]]; then
-    while IFS='=' read -r k v; do case $k in pr_number) pn=$v ;; pr_url) pu=$v ;; esac; done <"$r/pr" 2>/dev/null || true
-  fi
-  stopped=$(grep -m1 '^STOPPED:' "$r/PROGRESS.md" 2>/dev/null | sed 's/^STOPPED:[[:space:]]*//') || true
-  [[ -z $st || $st == complete ]] || astatus=$(plan_agent_status "$(agent_name "$branch")")
 
-  jq -nc --arg branch "$branch" --arg agent "$(agent_name "$branch")" --arg wt "$d" \
-    --arg repo "$(basename "$(dirname "$d")")" --arg status "$st" --argjson stage "$stg" --argjson total "$total" \
-    --arg persona "$per" --arg kind "$knd" --arg base "$bs" --arg verify "$ver" --arg mtime "$mtime" \
-    --arg dhost "$host" --arg dpid "$dpid" --arg dhb "$hb" --argjson dproc "$proc_ok" --arg me "$(hostname -s 2>/dev/null)" \
-    --arg astatus "$astatus" --arg stopped "$stopped" --arg pn "$pn" --arg pu "$pu" --arg err "$err" \
-    --argjson hasev "$hasev" --slurpfile ev "$tmp/ev" --slurpfile sd "$tmp/stages" '
-    def nul: if . == "" then null else . end;
-    ($ev) as $E
-    | ($dhb | nul) as $hbv
-    | (if $dhb == "" then null else (try ($dhb | fromdateiso8601) catch null) end) as $hbt
-    | ($hbt != null and $dproc and $dhost == $me and ((now - $hbt) < 120)) as $alive
-    | ($E | last // null) as $le
-    | ($stage == 1 and $status == "pending" and ($alive | not) and ($le.event? == "dry_stop")) as $ready
-    | {branch: $branch, agent: $agent, worktree: $wt, repo: $repo,
-       status: ($status | nul), stage: $stage, total: $total,
-       persona: ($persona | nul), kind: ($kind | nul), base: ($base | nul), verify: ($verify | nul),
-       started_at: (($E | first // null | .at?) // $mtime), updated_at: (($le | .at?) // $mtime),
-       driver: (if $dpid == "" and $dhb == "" then {alive: false, pid: null, host: null, heartbeat_at: null}
-                else {alive: $alive, pid: (try ($dpid | tonumber) catch null), host: ($dhost | nul), heartbeat_at: $hbv} end),
-       agent_status: ($astatus | nul), stopped: ($stopped | nul), ready: $ready,
-       pr: (if $pu == "" and $pn == "" then null else {number: (try ($pn | tonumber) catch null), url: ($pu | nul)} end),
-       stages: [$sd[] | . as $s | ($E | map(select(.stage == $s.n))) as $en
-         | ($en | map(select(.event == "verified")) | last) as $ver
-         | ($en | map(select(.event == "gate_fail" or .event == "verified" or .event == "failed")) | last) as $g
-         | {n: $s.n, title: $s.title, verify: $s.verify,
-            status: (if $s.n < $stage then "verified" elif $s.n == $stage then $status else "pending" end),
-            started_at: ($en | map(select(.event == "stage_start")) | first | .at?),
-            ended_at: ($ver | .at?),
-            attempts: (if $hasev then ($en | map(select(.event == "stage_start" or .event == "fixup")) | length) else null end),
-            gate: (if $g == null then null else {ok: ($g.event == "verified"), at: $g.at, message: ($g.msg // null)} end),
-            progress: $s.progress}],
-       last_event: (if $le == null then null else {at: $le.at, event: $le.event, msg: ($le.msg // null)} end)}
-    + (if $err == "" then {} else {error: $err} end)'
+  i=0
+  for d in "$@"; do
+    r=$d/.herd/run
+    # The cache key: format version, then mtime and size of HEAD and each file, "-" if absent.
+    key=$plan_status_cache_v
+    for f in "${heads[i]}" "$r"/{state,stages.md,PROGRESS.md,events.ndjson,driver,pr}; do
+      if [[ -n $f && ! -e $f ]]; then key+=" -"
+      elif [[ -n $f && -n ${fst[$f]:-} ]]; then key+=" ${fst[$f]}"
+      else key=""; break; fi
+    done
+    line=""
+    if [[ -n $key && -z $plan_status_nocache && -r $r/status.json ]] && { read -r line <"$r/status.json" || true; } &&
+       [[ $line == "{\"key\":\"$key\",\"plan\":{"*"}}" ]]; then
+      printf '{"i":%d,"k":"c","c":%s}\n' "$i" "$line" >>"$tmp/stream"
+      [[ $line == *',"status":"complete","stage":'* ]] || need_agents=1
+      g=${d%/*}
+      facts+=("$d" "${g##*/}" "$key" 1 "" "" 0 "" "" "" "" "" "" "" "" false "" "" "")
+      i=$((i + 1)); continue
+    fi
+
+    err="" st="" stg="" per="" knd="" bs="" ver="" host="" hb="" dpid="" proc_ok=false pn="" pu=""
+    if [[ -r $r/state ]]; then
+      while IFS='=' read -r k v; do
+        case $k in stage) stg=$v ;; status) st=$v ;; persona) per=$v ;; kind) knd=$v ;; verify) ver=$v ;; base) bs=$v ;; esac
+      done <"$r/state" 2>/dev/null || true
+      [[ -n $st ]] || err="state has no status"
+    else err="cannot read $r/state"; fi
+    [[ $stg =~ ^[0-9]+$ ]] || { [[ -n $err ]] || err="state has no stage"; stg=0; }
+    mt=${fst[$r/state]:-}; mt=${mt%% *}; mt=${mt%%.*}
+    [[ -n $mt ]] || mt=$(date -u -r "$r/state" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+    [[ -r $r/driver ]] && while IFS='=' read -r k v; do
+      case $k in pid) dpid=$v ;; host) host=$v ;; heartbeat) hb=$v ;; esac
+    done <"$r/driver" 2>/dev/null || true
+    if [[ -n $dpid ]] && plan_pid_is_herd "$dpid"; then proc_ok=true; fi
+    if [[ -r $r/pr ]]; then
+      while IFS='=' read -r k v; do case $k in pr_number) pn=$v ;; pr_url) pu=$v ;; esac; done <"$r/pr" 2>/dev/null || true
+    fi
+    branch=$(git -C "$d" symbolic-ref -q --short HEAD 2>/dev/null) || branch=${d##*/}
+    [[ -z $st || $st == complete ]] || need_agents=1
+    g=${d%/*}
+    facts+=("$d" "${g##*/}" "$key" "" "$branch" "$st" "$stg" "$per" "$knd" "$bs" "$ver" "$mt"
+            "$host" "$dpid" "$hb" "$proc_ok" "$pn" "$pu" "$err")
+    awk_args+=("ri=$i")
+    for k in stages:stages.md progress:PROGRESS.md events:events.ndjson; do
+      [[ ! -r $r/${k#*:} ]] || { awk_args+=("kind=${k%%:*}" "$r/${k#*:}"); files=1; }
+    done
+    i=$((i + 1))
+  done
+
+  ((!files)) || LC_ALL=C awk "$plan_status_awk" "${awk_args[@]}" >>"$tmp/stream" 2>/dev/null || true
+  : >>"$tmp/stream" >>"$tmp/agents"
+  ((!need_agents)) || plan_agent_list "$tmp/agents"
+  if ! jq -nr -R --rawfile ag "$tmp/agents" --arg me "$me" --argjson nf "$plan_status_nf" "$plan_status_jq" \
+         --args ${facts[@]+"${facts[@]}"} <"$tmp/stream" >"$tmp/out"; then
+    echo "herd: plan status: could not build the JSON" >&2
+    jq -nc --arg h "$me" '{version: 1, host: $h, plans: []}'; rm -rf "$tmp"; return 0
+  fi
+  { IFS= read -r doc
+    while IFS=$'\t' read -r i c; do
+      d=${facts[i * plan_status_nf]}; r=$d/.herd/run
+      if [[ $c == drop ]]; then drops+=("$r/status.json")
+      elif printf '%s\n' "$c" 2>/dev/null >"$r/status.json.$$"; then
+        mv -f "$r/status.json.$$" "$r/status.json" 2>/dev/null || rm -f "$r/status.json.$$"
+      fi
+    done; } <"$tmp/out"
   rm -rf "$tmp"
+  # A status.json that matched its key but isn't JSON: drop it and read those runs afresh.
+  if ((${#drops[@]})) && [[ -z $plan_status_nocache ]]; then
+    rm -f "${drops[@]}"; plan_status_nocache=1 plan_status_json "$@"; return
+  fi
+  printf '%s\n' "$doc"
 }
 
 # herd plan stop [--kill] [-r repo] <branch> [reason...]: appends "STOPPED: reason" to the run's
@@ -1065,8 +1206,7 @@ cmd_plan_status() {
     fi
   fi
   tmp=$(mktemp "${TMPDIR:-/tmp}/herd-ps.XXXXXX")
-  for p in ${paths[@]+"${paths[@]}"}; do plan_status_one "$p" || true; done |
-    jq -sc --arg h "$(hostname -s 2>/dev/null)" '{version: 1, host: $h, plans: (sort_by(.updated_at) | reverse)}' >"$tmp"
+  plan_status_json ${paths[@]+"${paths[@]}"} >"$tmp"
   if ((json)); then cat "$tmp"
   elif [[ $(jq '.plans | length' "$tmp") -eq 0 ]]; then echo "no plan runs"
   else plan_status_table "$tmp"; fi

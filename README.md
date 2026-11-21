@@ -282,9 +282,12 @@ herd plan status --json --all        # every run under ~/git/wt/*/*/
 `.herd/run/`: besides `state` herd writes `events.ndjson` (an append-only log, one JSON object per
 line: `at`, `stage`, `event`, `status`, optional `msg`), `driver` (`pid`, `host`, `started`, and a
 `heartbeat` rewritten every 30 s while herd runs; removed when it exits) and, on a finished last
-stage, `pr` (`pr_number`, `pr_url`). It never calls the forge, and touches herdr only for
-`agent get`, once per unfinished run, cut off after 3 s. Runs are sorted by `updated_at`, newest
-first. An unknown branch is noted on stderr and makes the exit status 1; a run that can't be
+stage, `pr` (`pr_number`, `pr_url`). It never calls the forge, and touches herdr only for one
+`agent list` per call (when some run isn't complete), cut off after 3 s. The one file it writes is
+`.herd/run/status.json`: a complete or failed run with no live driver caches its object there,
+reused while the run's files and the worktree's HEAD keep the same mtimes and sizes (GNU find
+reads those; elsewhere nothing is cached). Its `agent_status` is still asked every time. Runs are
+sorted by `updated_at`, newest first. An unknown branch is noted on stderr and makes the exit status 1; a run that can't be
 read is listed with an `error` and whatever could be read.
 
 `--json` prints one object. Tether reads this; it is versioned. This is a contract: fields are added, never renamed or removed, and

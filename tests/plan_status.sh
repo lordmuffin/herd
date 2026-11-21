@@ -142,15 +142,16 @@ mkdir -p "$T/bin"
 cat >"$T/bin/herdr" <<'FAKE'
 #!/usr/bin/env bash
 echo "$*" >>"$HOME/calls"
-[[ "$1 $2" == "agent get" ]] && echo '{"result":{"agent":{"agent_status":"working"}}}'
+[[ "$1 $2" == "agent list" ]] && echo '{"result":{"agents":[{"name":"feat-running","agent_status":"working"},{"name":"feat-complete","agent_status":"done"}]}}'
 [[ "$1 $2" == "worktree list" ]] && exit 1
 exit 0
 FAKE
 chmod +x "$T/bin/herdr"
 PATH=$T/bin:$PATH run_status --json
-check "taken from herdr agent get" jqt feat/running '.agent_status == "working"'
+check "taken from herdr agent list" jqt feat/running '.agent_status == "working"'
 check "complete runs are not asked" jqt feat/complete '.agent_status == null'
-check "herdr was only asked agent get" eval '! grep -qv "^agent get " "$T/calls"'
+check "agents herdr doesn't list are null" jqt feat/blocked '.agent_status == null'
+check "herdr was asked agent list, once for all runs" eval '[[ $(cat "$T/calls") == "agent list" ]]'
 printf '#!/usr/bin/env bash\nsleep 30\n' >"$T/bin/herdr"
 start=$SECONDS
 PATH=$T/bin:$PATH run_status --json feat/running
@@ -228,6 +229,30 @@ gold
 if [[ -n ${HERD_GOLDEN_UPDATE:-} ]]; then cp "$T/out" "$golden"; echo "  (rewrote $golden)"; fi
 check "the first call matches the golden JSON" cmp -s "$T/out" "$golden"
 check "31 runs" eval '[[ $(jq ".plans | length" "$T/out") == 31 ]]'
+check "herdr is asked once, with agent list" eval '[[ $(cat "$G/calls") == "agent list" ]]'
+rm -f "$G/calls"
+gold
+check "a second, cached call matches it too" cmp -s "$T/out" "$golden"
+check "finished runs are cached, live ones are not" eval '
+  [[ -s $G/git/wt/proj/feat-done-1/.herd/run/status.json && -s $G/git/wt/proj/fix-failed-1/.herd/run/status.json ]] &&
+  [[ ! -e $G/git/wt/proj/feat-running/.herd/run/status.json && ! -e $G/git/wt/proj/feat-stopped/.herd/run/status.json ]]'
+check "the cache keeps agent_status live for failed runs" jqt fix/failed-1 '.agent_status == "idle"'
+jq -c '.result.agents[2].agent_status = "working"' "$G/agents.json" >"$G/agents.tmp" && mv "$G/agents.tmp" "$G/agents.json"
+gold
+check "a failed run's agent_status follows herdr, cached or not" jqt fix/failed-1 '.agent_status == "working"'
+printf '{"at":"2026-11-18T00:00:00Z","stage":3,"event":"note","status":"complete"}\n' \
+  >>"$G/git/wt/proj/feat-done-1/.herd/run/events.ndjson"
+gold
+check "a changed file is read again, not taken from the cache" \
+  jqt feat/done-1 '.updated_at == "2026-11-18T00:00:00Z" and .last_event.event == "note"'
+printf 'garbage\n' >"$G/git/wt/proj/feat-done-2/.herd/run/status.json"
+gold
+check "a status.json that isn't ours is ignored" jqt feat/done-2 '.status == "complete" and .stages[0].title == "Title 1"'
+c3=$G/git/wt/proj/feat-done-3/.herd/run/status.json
+sed -i 's/"stages":\[/"stages":[[[/' "$c3"
+gold
+check "a status.json with the right key but broken JSON is dropped and read afresh" eval '
+  jqt feat/done-3 ".status == \"complete\" and .stages[0].title == \"Title 1\"" && jq -e .plan.stages "$c3" >/dev/null'
 
 kill "$live"
 echo "$pass passed, $fail failed"
